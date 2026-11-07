@@ -1,12 +1,12 @@
-// 🐊 «Крокодил» — Telegram-бот для групп
-// Cloudflare Workers + Durable Objects: по одному объекту на каждую группу.
-// Объект группы обрабатывает её события строго по очереди, поэтому
-// два игрока не могут "угадать одновременно" и получить очки дважды.
+// 🐊 «Крокодил» — Telegram-бот для групп + Супер-игра (Арена)
+// Cloudflare Workers + Durable Objects:
+//   CrocodileGame — по одному объекту на каждую группу (раунды, рейтинг группы)
+//   ArenaRegistry — один общий объект: все группы, их лидеры, лобби Супер-игры
 
 import { DurableObject } from "cloudflare:workers";
 import { WORDS_BY_LEVEL } from "./words.js";
 
-// ================== НАСТРОЙКИ ==================
+// ================== НАСТРОЙКИ ИГРЫ ==================
 const LEVELS = {
   easy: { name: "🟢 Лёгкий", mult: 1, about: "простые предметы, животные, еда" },
   medium: { name: "🟡 Средний", mult: 1.5, about: "профессии, места, техника" },
@@ -22,10 +22,23 @@ const RECENT_LIMIT = 150;                         // не повторять п�
 const LEADER_PENALTY = 3;                         // штраф ведущему, если он сам написал слово
 const DEFAULT_SETTINGS = { level: "medium", timed: true, timeSec: 300 };
 
+// ================== НАСТРОЙКИ СУПЕР-ИГРЫ ==================
+// Можно переопределить переменными в Cloudflare (Settings → Variables):
+// ARENA_MIN_POINTS, ARENA_MIN_PLAYERS, ARENA_LOBBY_SIZE — удобно для теста
+const ARENA_SETTINGS = { level: "ultimate", timed: true, timeSec: 180 };
+const LOBBY_TTL_MS = 48 * 60 * 60 * 1000;   // сколько лобби ждёт соперников
+const INVITE_LIMIT = 30;                     // максимум групп, куда рассылается вызов
+const MIN_GUESS_SEC = 4;                     // угадал быстрее — очки "на сложном" не идут (защита от сговора)
+const PAIR_DAILY_LIMIT = 5;                  // одна пара ведущий→угадавший: максимум N зачётных раундов в день
+const minPoints = (env) => Number(env.ARENA_MIN_POINTS) || 1000;
+const minPlayers = (env) => Number(env.ARENA_MIN_PLAYERS) || 5;
+const lobbySize = (env) => Number(env.ARENA_LOBBY_SIZE) || 4;
+
 const COMMANDS = [
   { command: "game", description: "🐊 Начать игру" },
   { command: "top", description: "🏆 Таблица лидеров группы" },
   { command: "me", description: "📊 Моя статистика" },
+  { command: "challenge", description: "⚔️ Вызов на Супер-игру (для лидера группы)" },
   { command: "settings", description: "⚙️ Сложность и время (админы)" },
   { command: "stop", description: "🛑 Остановить игру" },
   { command: "rules", description: "📖 Правила и очки" },
@@ -39,7 +52,7 @@ const HOW_TO_PLAY =
   "4. Кто первым угадал — получает очки. Ведущий тоже получает очки за хорошее объяснение.\n" +
   "5. Очки копятся, у каждой группы своя таблица лидеров — /top.";
 
-function rulesText(s) {
+function rulesText(s, env) {
   s = s || DEFAULT_SETTINGS;
   return (
     "📖 <b>Правила «Крокодила»</b>\n\n" +
@@ -51,6 +64,9 @@ function rulesText(s) {
     "🎯 Угадавший: 3, +2 если за 30 сек, +1 если за минуту.\n" +
     "🎤 Ведущий: 2, +2 если хватило 3 сообщений (+1 если до 6), +1 если угадали за минуту.\n" +
     "✖️ Множитель сложности: 🟢 ×1 · 🟡 ×1.5 · 🔴 ×2 · 💀 ×3\n\n" +
+    "<b>🏟 Супер-игра</b>\n" +
+    `Лидер группы (№1 в /top), набравший ${minPoints(env)}+ очков на 🔴 Сложном или 💀 Ультимейте, ` +
+    `может бросить вызов лидерам других групп — /challenge. В группе должно быть минимум ${minPlayers(env)} игроков.\n\n` +
     "<b>Сейчас в группе:</b>\n" +
     settingsLine(s)
   );
@@ -72,13 +88,16 @@ export default {
       const webhook = await tg(env, "setWebhook", {
         url: `${url.origin}/webhook`,
         secret_token: env.WEBHOOK_SECRET,
-        allowed_updates: ["message", "callback_query"],
+        allowed_updates: ["message", "callback_query", "chat_join_request"],
         drop_pending_updates: true,
       });
       const commands = await tg(env, "setMyCommands", { commands: COMMANDS });
 
       if (me.ok && webhook.ok && commands.ok) {
-        return text(`✅ Готово! Бот @${me.result.username} подключён.\nДобавь его в группу, сделай админом и напиши /game`);
+        return text(
+          `✅ Готово! Бот @${me.result.username} подключён.\n` +
+            (env.OWNER_ID ? `👑 Владелец: ${env.OWNER_ID}` : "⚠️ OWNER_ID не задан — команды Арены работать не будут.")
+        );
       }
       return text("⚠️ Что-то пошло не так:\n" + JSON.stringify({ me, webhook, commands }, null, 2), 500);
     }
@@ -94,7 +113,8 @@ export default {
         return text("ok");
       }
 
-      const chat = update.message?.chat || update.callback_query?.message?.chat;
+      const chat =
+        update.message?.chat || update.callback_query?.message?.chat || update.chat_join_request?.chat;
       try {
         if (!chat) {
           if (update.callback_query) await tg(env, "answerCallbackQuery", { callback_query_id: update.callback_query.id });
@@ -102,7 +122,7 @@ export default {
           const stub = env.GAME.get(env.GAME.idFromName(String(chat.id)));
           await stub.fetch("https://game/update", { method: "POST", body: JSON.stringify(update) });
         } else if (chat.type === "private" && update.message?.text) {
-          await sendPrivateHelp(env, chat.id);
+          await handlePrivate(env, update.message);
         }
       } catch (e) {
         console.log("webhook error", e?.stack || String(e));
@@ -114,20 +134,46 @@ export default {
   },
 };
 
-async function sendPrivateHelp(env, chatId) {
+async function handlePrivate(env, msg) {
+  const cmd = msg.text.trim().split(/\s+/)[0].split("@")[0].toLowerCase();
+
+  if (cmd === "/myid") {
+    return tg(env, "sendMessage", {
+      chat_id: msg.chat.id,
+      parse_mode: "HTML",
+      text: `🆔 Твой ID: <code>${msg.from.id}</code>\n\nВладелец бота вставляет это число в секрет OWNER_ID в Cloudflare.`,
+    });
+  }
+
+  if (cmd === "/arena_status" && isOwnerId(env, msg.from.id)) {
+    const res = await registry(env, "status", {});
+    return tg(env, "sendMessage", { chat_id: msg.chat.id, parse_mode: "HTML", text: res.text });
+  }
+
   const me = await tg(env, "getMe", {});
   const username = me.result?.username;
   await tg(env, "sendMessage", {
-    chat_id: chatId,
+    chat_id: msg.chat.id,
     parse_mode: "HTML",
     text:
       "🐊 <b>Привет! Я бот для игры «Крокодил».</b>\n\n" +
       "Добавь меня в группу, сделай админом и напиши там /game.\n\n" +
-      HOW_TO_PLAY,
+      HOW_TO_PLAY +
+      "\n\n🏟 Лучшие игроки групп встречаются в Супер-игре на Арене — подробнее в /rules внутри группы.",
     reply_markup: username
       ? { inline_keyboard: [[{ text: "➕ Добавить в группу", url: `https://t.me/${username}?startgroup=true` }]] }
       : undefined,
   });
+}
+
+function isOwnerId(env, userId) {
+  return !!env.OWNER_ID && String(userId) === String(env.OWNER_ID).trim();
+}
+
+async function registry(env, path, body) {
+  const stub = env.REGISTRY.get(env.REGISTRY.idFromName("main"));
+  const res = await stub.fetch("https://registry/" + path, { method: "POST", body: JSON.stringify(body) });
+  return res.json();
 }
 
 // ================== ИГРА: ОДИН ОБЪЕКТ НА ГРУППУ ==================
@@ -138,18 +184,28 @@ export class CrocodileGame extends DurableObject {
     this.round = { status: "idle" };
     this.recent = [];
     this.settings = null;
+    this.meta = {};          // { chatId, title }
+    this.isArena = false;    // эта группа — Арена Супер-игры
+    this.allowed = new Set(); // ID участников Супер-игры (только для Арены)
     ctx.blockConcurrencyWhile(async () => {
       this.round = (await ctx.storage.get("round")) || { status: "idle" };
       this.recent = (await ctx.storage.get("recent")) || [];
       this.settings = (await ctx.storage.get("settings")) || null;
+      this.meta = (await ctx.storage.get("meta")) || {};
+      this.isArena = !!(await ctx.storage.get("arena"));
+      this.allowed = new Set((await ctx.storage.get("allowed")) || []);
     });
   }
 
   async fetch(request) {
-    const update = await request.json();
+    const path = new URL(request.url).pathname;
+    const body = await request.json();
     try {
-      if (update.callback_query) await this.onCallback(update.callback_query);
-      else if (update.message) await this.onMessage(update.message);
+      if (path === "/allow") return Response.json(await this.allowPlayers(body.ids || []));
+      await this.rememberChat(body.message?.chat || body.callback_query?.message?.chat || body.chat_join_request?.chat);
+      if (body.callback_query) await this.onCallback(body.callback_query);
+      else if (body.message) await this.onMessage(body.message);
+      else if (body.chat_join_request) await this.onJoinRequest(body.chat_join_request);
     } catch (e) {
       console.log("game error", e?.stack || String(e));
     }
@@ -159,6 +215,12 @@ export class CrocodileGame extends DurableObject {
   // ---------- утилиты ----------
   tg(method, body) {
     return tg(this.env, method, body);
+  }
+  registry(path, body) {
+    return registry(this.env, path, body);
+  }
+  isOwner(uid) {
+    return isOwnerId(this.env, uid);
   }
   save() {
     return this.ctx.storage.put({ round: this.round, recent: this.recent });
@@ -183,7 +245,7 @@ export class CrocodileGame extends DurableObject {
     });
   }
   answer(cq, txt = "", alert = false) {
-    return this.tg("answerCallbackQuery", { callback_query_id: cq.id, text: txt.slice(0, 200), show_alert: alert });
+    return this.tg("answerCallbackQuery", { callback_query_id: cq.id, text: String(txt).slice(0, 200), show_alert: alert });
   }
   removeButtons(chatId, msgId) {
     if (!msgId) return;
@@ -193,7 +255,16 @@ export class CrocodileGame extends DurableObject {
     return this.round.status === "waiting" || this.round.status === "playing";
   }
   cfg() {
+    if (this.isArena) return ARENA_SETTINGS;
     return this.settings || DEFAULT_SETTINGS;
+  }
+
+  async rememberChat(chat) {
+    if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) return;
+    if (this.meta.chatId !== chat.id || this.meta.title !== chat.title) {
+      this.meta = { chatId: chat.id, title: chat.title || "" };
+      await this.ctx.storage.put("meta", this.meta);
+    }
   }
 
   async getMe() {
@@ -229,16 +300,60 @@ export class CrocodileGame extends DurableObject {
   }
 
   async addStats(userId, name, delta) {
-    const key = "u:" + userId;
-    const s = (await this.ctx.storage.get(key)) || { name, points: 0, guessed: 0, explained: 0, led: 0 };
-    s.name = name;
-    for (const k of Object.keys(delta)) s[k] = (s[k] || 0) + delta[k];
-    await this.ctx.storage.put(key, s);
+    const keys = ["u:" + userId];
+    if (this.isArena) keys.push("m:" + userId); // отдельный зачёт текущего матча Арены
+    for (const key of keys) {
+      const s = (await this.ctx.storage.get(key)) || { name, points: 0, hardPoints: 0, guessed: 0, explained: 0, led: 0 };
+      s.name = name;
+      for (const k of Object.keys(delta)) s[k] = (s[k] || 0) + delta[k];
+      await this.ctx.storage.put(key, s);
+    }
+  }
+
+  // Защита от накрутки: одна пара "ведущий → угадавший" не больше N зачётных раундов в день
+  async pairAllowed(leaderId, guesserId) {
+    const day = new Date().toISOString().slice(0, 10);
+    let pairs = (await this.ctx.storage.get("pairs")) || {};
+    if (pairs.day !== day) pairs = { day, c: {} };
+    const key = leaderId + ":" + guesserId;
+    const count = pairs.c[key] || 0;
+    pairs.c[key] = count + 1;
+    await this.ctx.storage.put("pairs", pairs);
+    return count < PAIR_DAILY_LIMIT;
+  }
+
+  async playersSorted() {
+    const all = await this.ctx.storage.list({ prefix: "u:" });
+    return [...all.entries()]
+      .map(([k, s]) => ({ id: Number(k.slice(2)), ...s }))
+      .filter((s) => s.points !== 0 || s.guessed || s.explained)
+      .sort((a, b) => b.points - a.points);
+  }
+
+  // Снимок группы для общего реестра: лидер группы и число игроков
+  async snapshot() {
+    const players = await this.playersSorted();
+    const top = players[0];
+    return {
+      chatId: this.meta.chatId,
+      title: this.meta.title,
+      players: players.length,
+      leader: top ? { id: top.id, name: top.name, points: top.points, hardPoints: top.hardPoints || 0 } : null,
+    };
+  }
+
+  async report() {
+    if (this.isArena || !this.meta.chatId) return;
+    try {
+      await this.registry("report", { snap: await this.snapshot() });
+    } catch (e) {
+      console.log("report failed", String(e));
+    }
   }
 
   // Таблица лидеров группы (берётся из сохранённой статистики)
-  async topLines(limit) {
-    const all = await this.ctx.storage.list({ prefix: "u:" });
+  async topLines(limit, prefix = "u:") {
+    const all = await this.ctx.storage.list({ prefix });
     const top = [...all.values()]
       .filter((s) => s.points !== 0 || s.guessed || s.explained)
       .sort((a, b) => b.points - a.points)
@@ -251,6 +366,10 @@ export class CrocodileGame extends DurableObject {
 
   // Шапка перед новой игрой: настройки + лидеры группы
   async introHeader() {
+    if (this.isArena) {
+      const top = await this.topLines(10, "m:");
+      return "🏟 <b>Супер-игра на Арене</b>\n" + settingsLine(this.cfg()) + (top ? "\n\n📊 <b>Счёт матча</b>\n" + top : "");
+    }
     const top = await this.topLines(5);
     return (
       settingsLine(this.cfg()) +
@@ -258,13 +377,56 @@ export class CrocodileGame extends DurableObject {
     );
   }
 
+  // ---------- Арена: кто может писать ----------
+  canPlayInArena(uid) {
+    return this.allowed.has(uid);
+  }
+
+  async restrict(chatId, userId, allow) {
+    const v = !!allow;
+    return this.tg("restrictChatMember", {
+      chat_id: chatId,
+      user_id: userId,
+      use_independent_chat_permissions: true,
+      permissions: {
+        can_send_messages: v, can_send_audios: v, can_send_documents: v, can_send_photos: v,
+        can_send_videos: v, can_send_video_notes: v, can_send_voice_notes: v, can_send_polls: v,
+        can_send_other_messages: v, can_add_web_page_previews: v,
+      },
+    });
+  }
+
+  async allowPlayers(ids) {
+    for (const id of ids) this.allowed.add(id);
+    await this.ctx.storage.put("allowed", [...this.allowed]);
+    if (this.isArena && this.meta.chatId) {
+      for (const id of ids) await this.restrict(this.meta.chatId, id, true); // снять ограничения, если были
+    }
+    return { ok: true };
+  }
+
+  async onJoinRequest(req) {
+    if (!this.isArena) return; // в обычных группах заявки не трогаем
+    const uid = req.from.id;
+    const method = this.canPlayInArena(uid) || this.isOwner(uid) ? "approveChatJoinRequest" : "declineChatJoinRequest";
+    await this.tg(method, { chat_id: req.chat.id, user_id: uid });
+  }
+
   // ---------- сообщения ----------
   async onMessage(msg) {
     const chatId = msg.chat.id;
+    const anonAdmin = msg.sender_chat?.id === chatId; // анонимный админ группы
 
-    // Бота добавили в группу → приветствие, правила и настройка
+    // Кто-то вошёл в группу
     if (msg.new_chat_members?.length) {
       const me = await this.getMe();
+      if (this.isArena) {
+        for (const u of msg.new_chat_members) {
+          if (u.is_bot || this.isOwner(u.id) || this.canPlayInArena(u.id)) continue;
+          await this.restrict(chatId, u.id, false); // не участник — только читать
+        }
+        return;
+      }
       if (msg.new_chat_members.some((u) => u.id === me.id)) {
         if (this.settings) {
           return this.send(chatId, "🐊 <b>Я снова с вами!</b>\n\n" + (await this.introHeader()) + "\n\nНачать игру — /game");
@@ -274,8 +436,17 @@ export class CrocodileGame extends DurableObject {
       return;
     }
 
+    // Арена: писать могут только участники Супер-игры и владелец
+    if (this.isArena && !anonAdmin && msg.from && !msg.from.is_bot) {
+      const uid = msg.from.id;
+      if (!this.isOwner(uid) && !this.canPlayInArena(uid)) {
+        await this.tg("deleteMessage", { chat_id: chatId, message_id: msg.message_id });
+        await this.restrict(chatId, uid, false);
+        return;
+      }
+    }
+
     if (!msg.text) return;
-    const anonAdmin = msg.sender_chat?.id === chatId; // анонимный админ группы
     if (msg.from?.is_bot && !anonAdmin) return;
 
     if (msg.text.startsWith("/")) return this.onCommand(msg, anonAdmin);
@@ -300,13 +471,22 @@ export class CrocodileGame extends DurableObject {
       case "/me":
       case "/stats":
         return this.cmdMe(msg);
+      case "/challenge":
+        return this.cmdChallenge(msg);
       case "/settings":
         return this.cmdSettings(msg, anonAdmin);
       case "/stop":
         return this.cmdStop(msg, anonAdmin);
       case "/rules":
       case "/help":
-        return this.send(msg.chat.id, rulesText(this.cfg()));
+        return this.send(msg.chat.id, rulesText(this.cfg(), this.env));
+      case "/arena_here":
+        return this.cmdArenaHere(msg);
+      case "/arena_finish":
+        return this.cmdArenaFinish(msg);
+      case "/arena_status":
+        if (!this.isOwner(msg.from?.id)) return;
+        return this.send(msg.chat.id, (await this.registry("status", {})).text);
     }
   }
 
@@ -327,6 +507,12 @@ export class CrocodileGame extends DurableObject {
       return this.send(chatId, `🎤 Сейчас объясняет <b>${esc(r.leaderName)}</b> — угадывайте!`);
     }
     if (r.status === "ended") return; // прямо сейчас подводятся итоги
+
+    if (this.isArena) {
+      if (!this.isOwner(msg.from?.id) && !this.canPlayInArena(msg.from?.id) && !anonAdmin) return;
+      if (!this.allowed.size) return this.send(chatId, "🏟 На Арене пока нет участников. Ждём, когда соберётся лобби.");
+      return this.openRound(chatId, await this.introHeader());
+    }
 
     // Первый запуск в группе → правила + настройка
     if (!this.settings) return this.startSetup(chatId, anonAdmin ? null : msg.from?.id, true);
@@ -410,6 +596,7 @@ export class CrocodileGame extends DurableObject {
 
   async cmdSettings(msg, anonAdmin) {
     const chatId = msg.chat.id;
+    if (this.isArena) return this.send(chatId, "🏟 На Арене настройки фиксированные:\n" + settingsLine(ARENA_SETTINGS));
     if (this.round.status === "playing") {
       return this.send(chatId, "Сейчас идёт раунд. Поменять настройки можно после него (или остановите игру — /stop).");
     }
@@ -463,15 +650,21 @@ export class CrocodileGame extends DurableObject {
   // Текст в чате во время раунда
   async onPlayingText(msg) {
     const r = this.round;
+    if (this.isArena && !this.canPlayInArena(msg.from.id)) return; // владелец не участвует
     const tokens = tokenize(msg.text);
     const hit = tokens.some((t) => matches(t, r.word));
+    const hardLevel = r.level === "hard" || r.level === "ultimate";
 
     // Пишет ведущий
     if (msg.from.id === r.leaderId) {
       r.leaderMsgs++;
       if (!hit) return; // счётчик живёт в памяти, лишние записи в базу не нужны
       r.status = "ended";
-      await this.addStats(r.leaderId, r.leaderName, { points: -LEADER_PENALTY });
+      await this.addStats(r.leaderId, r.leaderName, {
+        points: -LEADER_PENALTY,
+        ...(hardLevel && !this.isArena ? { hardPoints: -LEADER_PENALTY } : {}),
+      });
+      await this.report();
       return this.openRound(
         r.chatId,
         `🚫 Ведущий <b>${esc(r.leaderName)}</b> написал загаданное слово! Раунд аннулирован (−${LEADER_PENALTY} очка).\n` +
@@ -500,13 +693,18 @@ export class CrocodileGame extends DurableObject {
     const gp = Math.round(gBase * mult);
     const lp = Math.round(lBase * mult);
 
-    await this.addStats(msg.from.id, gName, { points: gp, guessed: 1 });
-    await this.addStats(r.leaderId, r.leaderName, { points: lp, explained: 1 });
+    // Очки "на сложном" (для допуска к Супер-игре) — с защитой от накрутки
+    let countsHard = hardLevel && !this.isArena && sec >= MIN_GUESS_SEC;
+    if (countsHard) countsHard = await this.pairAllowed(r.leaderId, msg.from.id);
+
+    await this.addStats(msg.from.id, gName, { points: gp, guessed: 1, ...(countsHard ? { hardPoints: gp } : {}) });
+    await this.addStats(r.leaderId, r.leaderName, { points: lp, explained: 1, ...(countsHard ? { hardPoints: lp } : {}) });
     await this.tg("setMessageReaction", {
       chat_id: r.chatId,
       message_id: msg.message_id,
       reaction: [{ type: "emoji", emoji: "🎉" }],
     });
+    await this.report();
 
     const header =
       `🎉 <b>${esc(gName)}</b> угадал(а) слово <b>${upper(r.word)}</b> за ${fmtTime(sec)}!\n` +
@@ -518,6 +716,9 @@ export class CrocodileGame extends DurableObject {
 
   // ---------- кнопки ----------
   async onCallback(cq) {
+    const data = String(cq.data || "");
+    if (data === "chal" || data.startsWith("acc:")) return this.onArenaCallback(cq, data);
+
     const r = this.round;
     const msgId = cq.message?.message_id;
     const valid = r.msgId && msgId === r.msgId && (this.isActive() || r.status === "setup");
@@ -531,9 +732,12 @@ export class CrocodileGame extends DurableObject {
 
     const isLeader = r.status === "playing" && cq.from.id === r.leaderId;
 
-    switch (cq.data) {
+    switch (data) {
       case "lead": {
         if (r.status !== "waiting") return this.answer(cq, "Ведущий уже выбран 🙂");
+        if (this.isArena && !this.canPlayInArena(cq.from.id)) {
+          return this.answer(cq, "🏟 Вести могут только участники Супер-игры", true);
+        }
         const s = this.cfg();
         const roundMs = s.timed ? s.timeSec * 1000 : UNTIMED_LIMIT_MS;
         const word = this.pickWord(s.level);
@@ -590,28 +794,124 @@ export class CrocodileGame extends DurableObject {
     return this.answer(cq);
   }
 
+  // ---------- Супер-игра: вызов и принятие ----------
+  async onArenaCallback(cq, data) {
+    if (this.isArena) return this.answer(cq, "На Арене это не работает");
+    const snap = await this.snapshot();
+    const user = { id: cq.from.id, name: displayName(cq.from) };
+
+    if (data === "chal") {
+      const res = await this.registry("challenge", { snap, userId: user.id });
+      await this.answer(cq, res.short || "⚔️", false);
+      return this.send(cq.message.chat.id, res.text);
+    }
+
+    const res = await this.registry("accept", { snap, userId: user.id, lobbyId: data.slice(4) });
+    await this.answer(cq, res.text, true);
+    if (res.ok && res.edit) await this.edit(cq.message.chat.id, cq.message.message_id, res.edit);
+    if (res.stale) await this.removeButtons(cq.message.chat.id, cq.message.message_id);
+  }
+
+  async cmdChallenge(msg) {
+    const chatId = msg.chat.id;
+    if (this.isArena) return;
+    if (!msg.from || msg.from.is_bot) return;
+    const res = await this.registry("challenge", { snap: await this.snapshot(), userId: msg.from.id });
+    return this.send(chatId, res.text);
+  }
+
+  // ---------- команды владельца: Арена ----------
+  async cmdArenaHere(msg) {
+    const chatId = msg.chat.id;
+    if (!this.isOwner(msg.from?.id)) return;
+    this.isArena = true;
+    await this.ctx.storage.put("arena", true);
+    const old = this.round;
+    this.round = { status: "idle" };
+    await this.save();
+    await this.ctx.storage.deleteAlarm();
+    if (old.msgId) await this.removeButtons(chatId, old.msgId);
+    const res = await this.registry("set_arena", { chatId, title: msg.chat.title || "" });
+    return this.send(
+      chatId,
+      "🏟 <b>Эта группа теперь Арена Супер-игры!</b>\n\n" +
+        "Писать здесь могут только участники собранного лобби и владелец. " +
+        "Остальные смогут только читать, их сообщения будут удаляться.\n\n" +
+        "<b>Проверь, что бот — админ с правами:</b>\n" +
+        "• Удаление сообщений\n• Блокировка пользователей\n• Пригласительные ссылки\n\n" +
+        (res.text || "")
+    );
+  }
+
+  async cmdArenaFinish(msg) {
+    const chatId = msg.chat.id;
+    if (!this.isOwner(msg.from?.id) || !this.isArena) return;
+    const all = await this.ctx.storage.list({ prefix: "m:" });
+    const results = [...all.entries()]
+      .map(([k, s]) => ({ id: Number(k.slice(2)), name: s.name, points: s.points, guessed: s.guessed || 0 }))
+      .sort((a, b) => b.points - a.points || b.guessed - a.guessed); // ничья → кто больше угадал
+    if (!results.length) return this.send(chatId, "Пока нет результатов матча — сыграйте хотя бы один раунд.");
+
+    const cur = this.round;
+    this.round = { status: "idle" };
+    await this.save();
+    await this.ctx.storage.deleteAlarm();
+    if (cur.msgId) await this.removeButtons(chatId, cur.msgId);
+
+    const medals = ["🥇", "🥈", "🥉"];
+    await this.send(
+      chatId,
+      "🏆 <b>Супер-игра завершена!</b>\n\n" +
+        results.map((r, i) => `${medals[i] || i + 1 + "."} <b>${esc(r.name)}</b> — ${r.points}`).join("\n") +
+        `\n\n👑 Чемпион Арены — <b>${esc(results[0].name)}</b>!`
+    );
+    await this.registry("finish", { results });
+
+    // Очистка: счёт матча и список участников
+    await this.ctx.storage.delete([...all.keys()]);
+    this.allowed = new Set();
+    await this.ctx.storage.put("allowed", []);
+  }
+
   // ---------- команды ----------
   async cmdTop(msg) {
     const lines = await this.topLines(10);
     if (!lines) return this.send(msg.chat.id, "🏆 Таблица лидеров пока пуста. Сыграйте — /game");
-    return this.send(msg.chat.id, "🏆 <b>Таблица лидеров группы</b>\n\n" + lines + "\n\n🎯 угадал · 🎤 объяснил");
+    const title = this.isArena ? "🏟 <b>Общий рейтинг Арены</b>" : "🏆 <b>Таблица лидеров группы</b>";
+    return this.send(msg.chat.id, title + "\n\n" + lines + "\n\n🎯 угадал · 🎤 объяснил");
   }
 
   async cmdMe(msg) {
     const chatId = msg.chat.id;
     if (!msg.from || msg.from.is_bot) return;
-    const all = await this.ctx.storage.list({ prefix: "u:" });
-    const me = all.get("u:" + msg.from.id);
-    if (!me) return this.send(chatId, `📊 <b>${esc(displayName(msg.from))}</b>, у тебя пока нет очков. Сыграй — /game`);
-    const sorted = [...all.values()].sort((a, b) => b.points - a.points);
-    const place = sorted.findIndex((s) => s === me) + 1;
+    const sorted = await this.playersSorted();
+    const idx = sorted.findIndex((s) => s.id === msg.from.id);
+    if (idx < 0) return this.send(chatId, `📊 <b>${esc(displayName(msg.from))}</b>, у тебя пока нет очков. Сыграй — /game`);
+    const me = sorted[idx];
+    const hp = me.hardPoints || 0;
+    const need = minPoints(this.env);
+
+    let arena = "";
+    let keyboard;
+    if (!this.isArena) {
+      arena = `\n\n🔥 Очки на 🔴/💀 (для Супер-игры): ${hp} / ${need}`;
+      if (idx === 0 && hp >= need && sorted.length >= minPlayers(this.env)) {
+        arena += "\n⚔️ Ты лидер группы и можешь бросить вызов лидерам других групп!";
+        keyboard = kb([[["⚔️ Бросить вызов топам", "chal"]]]);
+      } else if (idx === 0 && hp >= need) {
+        arena += `\nДля вызова в группе нужно минимум ${minPlayers(this.env)} игроков (сейчас ${sorted.length}).`;
+      }
+    }
+
     return this.send(
       chatId,
       `📊 <b>${esc(me.name)}</b>\n\n` +
-        `🏅 Место в группе: ${place} из ${sorted.length}\n` +
+        `🏅 Место в группе: ${idx + 1} из ${sorted.length}\n` +
         `⭐ Очки: ${me.points}\n` +
         `🎯 Угадано слов: ${me.guessed}\n` +
-        `🎤 Объяснено слов: ${me.explained} (был ведущим: ${me.led})`
+        `🎤 Объяснено слов: ${me.explained} (был ведущим: ${me.led})` +
+        arena,
+      keyboard ? { reply_markup: keyboard } : {}
     );
   }
 
@@ -625,7 +925,7 @@ export class CrocodileGame extends DurableObject {
     const uid = msg.from?.id;
     const isLeader = st === "playing" && uid === this.round.leaderId;
     const isInitiator = st === "setup" && uid && uid === this.round.initiatorId;
-    const allowed = isLeader || isInitiator || anonAdmin || (await this.isAdmin(chatId, uid));
+    const allowed = isLeader || isInitiator || anonAdmin || this.isOwner(uid) || (await this.isAdmin(chatId, uid));
     if (!allowed) return this.send(chatId, "🛑 Остановить игру может ведущий или админ группы.");
 
     const cur = this.round;
@@ -635,12 +935,12 @@ export class CrocodileGame extends DurableObject {
     await this.save();
     await this.ctx.storage.deleteAlarm();
     await this.removeButtons(chatId, cur.msgId);
-    const top = await this.topLines(5);
+    const top = await this.topLines(5, this.isArena ? "m:" : "u:");
     return this.send(
       chatId,
       "🛑 Игра остановлена." +
         (word ? `\nСлово было: <b>${upper(word)}</b>` : "") +
-        (top ? "\n\n🏆 <b>Таблица лидеров группы</b>\n" + top : "") +
+        (top ? `\n\n🏆 <b>${this.isArena ? "Счёт матча" : "Таблица лидеров группы"}</b>\n` + top : "") +
         "\n\nНовая игра — /game"
     );
   }
@@ -665,13 +965,14 @@ export class CrocodileGame extends DurableObject {
       this.round = { status: "idle" };
       await this.save();
       if (r.msgId) {
-        const top = await this.topLines(5);
+        const top = await this.topLines(5, this.isArena ? "m:" : "u:");
+        const already = (r.header || "").includes("Таблица лидеров") || (r.header || "").includes("Счёт матча");
         await this.edit(
           r.chatId,
           r.msgId,
           (r.header ? r.header + "\n\n" : "") +
             "😴 Никто не вызвался вести — игра на паузе." +
-            (top && !r.header.includes("Таблица лидеров") ? "\n\n🏆 <b>Таблица лидеров группы</b>\n" + top : "") +
+            (top && !already ? `\n\n🏆 <b>${this.isArena ? "Счёт матча" : "Таблица лидеров группы"}</b>\n` + top : "") +
             "\n\nСыграть ещё — /game"
         );
       }
@@ -681,6 +982,296 @@ export class CrocodileGame extends DurableObject {
     r.status = "ended";
     const why = r.timed ? "⏰ Время вышло — никто не угадал." : "⏰ Раунд закрыт: 30 минут никто не угадал.";
     return this.openRound(r.chatId, `${why}\nСлово было: <b>${upper(r.word)}</b>`, r.msgId);
+  }
+}
+
+// ================== РЕЕСТР СУПЕР-ИГРЫ: ОДИН НА ВЕСЬ БОТ ==================
+// Хранит: g:<chatId> — группы (номер, лидер, очки), lobby — текущее лобби, arena — группа-Арена
+// lobby.status: "open" (набираем) | "ready" (собрано, ждём матча)
+export class ArenaRegistry extends DurableObject {
+  async fetch(request) {
+    const path = new URL(request.url).pathname.slice(1);
+    const body = await request.json().catch(() => ({}));
+    let out = { ok: true };
+    try {
+      if (path === "report") out = { ok: true, group: await this.report(body.snap) };
+      else if (path === "challenge") out = await this.challenge(body.snap, body.userId);
+      else if (path === "accept") out = await this.accept(body.snap, body.userId, body.lobbyId);
+      else if (path === "set_arena") out = await this.setArena(body.chatId, body.title);
+      else if (path === "finish") out = await this.finish(body.results || []);
+      else if (path === "status") out = await this.status();
+    } catch (e) {
+      console.log("registry error", e?.stack || String(e));
+      out = { ok: false, text: "⚠️ Ошибка, попробуйте позже." };
+    }
+    return Response.json(out);
+  }
+
+  tg(method, body) {
+    return tg(this.env, method, body);
+  }
+  send(chatId, html, extra = {}) {
+    return this.tg("sendMessage", { chat_id: chatId, text: html, parse_mode: "HTML", link_preview_options: { is_disabled: true }, ...extra });
+  }
+
+  async report(snap) {
+    if (!snap?.chatId) return null;
+    const arena = await this.ctx.storage.get("arena");
+    if (arena && String(arena.chatId) === String(snap.chatId)) return null;
+    const key = "g:" + snap.chatId;
+    let g = await this.ctx.storage.get(key);
+    if (!g) {
+      const seq = ((await this.ctx.storage.get("seq")) || 0) + 1;
+      await this.ctx.storage.put("seq", seq);
+      g = { chatId: snap.chatId, no: seq, titles: 0 };
+    }
+    g.title = snap.title || g.title || "";
+    g.players = snap.players || 0;
+    g.leader = snap.leader || null;
+    g.updated = Date.now();
+    await this.ctx.storage.put(key, g);
+    return g;
+  }
+
+  eligible(g) {
+    return !!(g && g.leader && g.leader.hardPoints >= minPoints(this.env) && g.players >= minPlayers(this.env));
+  }
+
+  whyNot(g, userId) {
+    if (!g || !g.leader || g.leader.id !== userId) {
+      return "⚔️ Бросить вызов может только лидер группы — игрок №1 в /top.";
+    }
+    const need = minPoints(this.env);
+    const lines = [];
+    if (g.leader.hardPoints < need) lines.push(`• очки на 🔴 Сложном / 💀 Ультимейте: ${g.leader.hardPoints} из ${need}`);
+    if (g.players < minPlayers(this.env)) lines.push(`• игроков в группе: ${g.players} из ${minPlayers(this.env)}`);
+    return "⚔️ Пока рано для Супер-игры. Не хватает:\n" + lines.join("\n");
+  }
+
+  participant(g) {
+    return { userId: g.leader.id, name: g.leader.name, chatId: g.chatId, no: g.no, hardPoints: g.leader.hardPoints };
+  }
+
+  async challenge(snap, userId) {
+    const g = await this.report(snap);
+    if (!g) return { text: "Здесь это не работает." };
+    if (!this.eligible(g) || g.leader.id !== userId) return { text: this.whyNot(g, userId), short: "Пока рано" };
+
+    const size = lobbySize(this.env);
+    let lobby = await this.ctx.storage.get("lobby");
+
+    if (lobby?.status === "ready") {
+      return { text: "🏟 Сейчас готовится Супер-игра. Новые вызовы — после её завершения.", short: "Арена занята" };
+    }
+    if (lobby?.status === "open") {
+      if (lobby.participants.some((p) => p.userId === userId)) {
+        return { text: `⏳ Ты уже в лобби (${lobby.participants.length}/${size}). Ждём соперников.`, short: "Ты уже в лобби" };
+      }
+      if (lobby.participants.some((p) => String(p.chatId) === String(g.chatId))) {
+        return { text: "От вашей группы уже есть участник лобби.", short: "Уже есть участник" };
+      }
+      const ready = await this.addParticipant(lobby, g);
+      return {
+        text: ready
+          ? "✅ Ты в лобби! Лобби собрано — инструкции придут сюда же."
+          : `✅ Ты присоединился к открытому лобби Супер-игры (${lobby.participants.length}/${size}).`,
+        short: "Ты в лобби!",
+      };
+    }
+
+    // Новое лобби
+    lobby = {
+      id: crypto.randomUUID().slice(0, 8),
+      status: "open",
+      participants: [this.participant(g)],
+      invited: [],
+      createdAt: Date.now(),
+      expires: Date.now() + LOBBY_TTL_MS,
+    };
+    const all = await this.ctx.storage.list({ prefix: "g:" });
+    const targets = [...all.values()]
+      .filter((x) => String(x.chatId) !== String(g.chatId) && this.eligible(x))
+      .sort((a, b) => b.leader.hardPoints - a.leader.hardPoints)
+      .slice(0, INVITE_LIMIT);
+    lobby.invited = targets.map((x) => x.chatId);
+    await this.ctx.storage.put("lobby", lobby);
+    await this.ctx.storage.setAlarm(lobby.expires);
+
+    for (const x of targets) {
+      await this.send(
+        x.chatId,
+        "⚔️ <b>Вызов на Супер-игру!</b>\n\n" +
+          `Лидер <b>Группы #${g.no}</b> (🔥 ${g.leader.hardPoints} очков на сложном) вызывает лучших игроков на Арену за звание чемпиона.\n\n` +
+          `Лидер вашей группы — <b>${esc(x.leader.name)}</b> (🔥 ${x.leader.hardPoints}). Принять вызов может только он(а).\n` +
+          `Лобби: 1/${size} · открыто 48 часов`,
+        { reply_markup: kb([[["⚔️ Принять вызов", "acc:" + lobby.id]]]) }
+      );
+    }
+
+    return {
+      short: "Вызов брошен!",
+      text: targets.length
+        ? `⚔️ <b>Вызов брошен!</b>\nПриглашения отправлены лидерам ${targets.length} ${plural(targets.length, "группы", "групп", "групп")}.\nЛобби: 1/${size} · ждём 48 часов.`
+        : `⚔️ <b>Лобби открыто!</b> (1/${size})\nСейчас других групп с лидерами ${minPoints(this.env)}+ нет. ` +
+          "Как только появятся — смогут присоединиться командой /challenge. Лобби ждёт 48 часов.",
+    };
+  }
+
+  async accept(snap, userId, lobbyId) {
+    const g = await this.report(snap);
+    const lobby = await this.ctx.storage.get("lobby");
+    const size = lobbySize(this.env);
+    if (!lobby || lobby.id !== lobbyId || lobby.status !== "open") {
+      return { ok: false, stale: true, text: "⌛ Этот вызов уже неактуален." };
+    }
+    if (!g || !g.leader || g.leader.id !== userId) return { ok: false, text: "Принять вызов может только лидер группы (№1 в /top)." };
+    if (!this.eligible(g)) return { ok: false, text: this.whyNot(g, userId) };
+    if (lobby.participants.some((p) => p.userId === userId)) return { ok: false, text: "Ты уже в лобби 👍" };
+    if (lobby.participants.some((p) => String(p.chatId) === String(g.chatId))) {
+      return { ok: false, text: "От вашей группы уже есть участник." };
+    }
+    const ready = await this.addParticipant(lobby, g);
+    return {
+      ok: true,
+      text: "✅ Вызов принят!",
+      edit:
+        `⚔️ <b>${esc(g.leader.name)}</b> принял(а) вызов на Супер-игру!\n` +
+        `Лобби: ${lobby.participants.length}/${size}` +
+        (ready ? "\n\n🏟 Лобби собрано — инструкции ниже." : "\nЖдём остальных соперников."),
+    };
+  }
+
+  // Добавить участника; если лобби заполнилось — запустить подготовку
+  async addParticipant(lobby, g) {
+    lobby.participants.push(this.participant(g));
+    const ready = lobby.participants.length >= lobbySize(this.env);
+    if (ready) lobby.status = "ready";
+    await this.ctx.storage.put("lobby", lobby);
+    if (ready) {
+      await this.ctx.storage.deleteAlarm();
+      await this.onReady(lobby);
+    }
+    return ready;
+  }
+
+  async onReady(lobby) {
+    const arena = await this.ctx.storage.get("arena");
+    const ids = lobby.participants.map((p) => p.userId);
+    let link = null;
+
+    if (arena) {
+      const stub = this.env.GAME.get(this.env.GAME.idFromName(String(arena.chatId)));
+      await stub.fetch("https://game/allow", { method: "POST", body: JSON.stringify({ ids }) });
+      const res = await this.tg("createChatInviteLink", {
+        chat_id: arena.chatId,
+        name: "Super game " + lobby.id,
+        creates_join_request: true,
+      });
+      link = res.result?.invite_link || null;
+    }
+
+    const groupsList = lobby.participants.map((p) => `Группа #${p.no}`).join(", ");
+    for (const p of lobby.participants) {
+      await this.send(
+        p.chatId,
+        "🏟 <b>Лобби Супер-игры собрано!</b>\n\n" +
+          `Соперники: ${groupsList}\n\n` +
+          `<b>${esc(p.name)}</b>, ты представляешь свою группу! 💪\n` +
+          (link
+            ? `\n👉 Вход на Арену: ${link}\nНажми «Подать заявку» — бот пустит только участников.`
+            : "\nВладелец бота скоро пришлёт приглашение на Арену.")
+      );
+    }
+
+    if (this.env.OWNER_ID) {
+      await this.send(
+        this.env.OWNER_ID,
+        `🏟 <b>Лобби Супер-игры готово</b> (${lobby.participants.length} игроков)\n\n` +
+          lobby.participants
+            .map((p) => `• <b>${esc(p.name)}</b> — Группа #${p.no}${p.chatId ? "" : ""}, 🔥 ${p.hardPoints}, id <code>${p.userId}</code>`)
+            .join("\n") +
+          (arena
+            ? `\n\nСсылка-заявка отправлена участникам: ${link || "⚠️ не удалось создать (проверь права бота в Арене)"}\n` +
+              "Когда все зайдут — напиши /game в Арене. В конце — /arena_finish."
+            : "\n\n⚠️ Арена не назначена. Создай группу, добавь туда бота админом и напиши в ней /arena_here — участники получат ссылку автоматически.")
+      );
+    }
+  }
+
+  async setArena(chatId, title) {
+    await this.ctx.storage.put("arena", { chatId, title });
+    await this.ctx.storage.delete("g:" + chatId); // Арена не участвует в рейтинге групп
+    const lobby = await this.ctx.storage.get("lobby");
+    if (lobby?.status === "ready") {
+      await this.onReady(lobby);
+      return { text: "✅ Лобби уже собрано — участники получили ссылку на вход." };
+    }
+    return { text: "Когда соберётся лобби, участники получат ссылку на вход, а ты — уведомление в личку." };
+  }
+
+  async finish(results) {
+    const lobby = await this.ctx.storage.get("lobby");
+    if (lobby) {
+      const byId = new Map(lobby.participants.map((p) => [p.userId, p]));
+      const medals = ["🥇", "🥈", "🥉"];
+      const winner = byId.get(results[0]?.id);
+      if (winner) {
+        const g = await this.ctx.storage.get("g:" + winner.chatId);
+        if (g) {
+          g.titles = (g.titles || 0) + 1;
+          await this.ctx.storage.put("g:" + winner.chatId, g);
+        }
+      }
+      for (const p of lobby.participants) {
+        const lines = results.map((r, i) => {
+          const rp = byId.get(r.id);
+          const who = r.id === p.userId ? `<b>${esc(p.name)}</b> (ваша группа)` : `Лидер Группы #${rp ? rp.no : "?"}`;
+          return `${medals[i] || i + 1 + "."} ${who} — ${r.points}`;
+        });
+        await this.send(
+          p.chatId,
+          "🏆 <b>Итоги Супер-игры</b>\n\n" +
+            lines.join("\n") +
+            (winner && winner.userId === p.userId ? `\n\n👑 <b>${esc(p.name)}</b> — Чемпион Арены! Поздравляем вашу группу!` : "")
+        );
+      }
+    }
+    await this.ctx.storage.delete("lobby");
+    await this.ctx.storage.deleteAlarm();
+    return { ok: true };
+  }
+
+  async status() {
+    const lobby = await this.ctx.storage.get("lobby");
+    const arena = await this.ctx.storage.get("arena");
+    const all = [...(await this.ctx.storage.list({ prefix: "g:" })).values()];
+    const eligible = all.filter((g) => this.eligible(g));
+    let t =
+      "🏟 <b>Статус Супер-игры</b>\n\n" +
+      `Арена: ${arena ? esc(arena.title || String(arena.chatId)) : "не назначена (/arena_here в группе)"}\n` +
+      `Групп в реестре: ${all.length}\n` +
+      `Лидеров, готовых к вызову: ${eligible.length}\n` +
+      `Порог: ${minPoints(this.env)} очков на сложном, ${minPlayers(this.env)}+ игроков, лобби на ${lobbySize(this.env)}\n\n`;
+    if (!lobby) t += "Лобби: нет";
+    else
+      t +=
+        `Лобби: ${lobby.status === "open" ? "набирается" : "собрано"} (${lobby.participants.length}/${lobbySize(this.env)})\n` +
+        lobby.participants.map((p) => `• ${esc(p.name)} — Группа #${p.no}, id <code>${p.userId}</code>`).join("\n");
+    return { text: t };
+  }
+
+  // Лобби не набралось за 48 часов
+  async alarm() {
+    const lobby = await this.ctx.storage.get("lobby");
+    if (!lobby || lobby.status !== "open") return;
+    if (Date.now() < lobby.expires - 1000) {
+      await this.ctx.storage.setAlarm(lobby.expires);
+      return;
+    }
+    await this.ctx.storage.delete("lobby");
+    for (const p of lobby.participants) {
+      await this.send(p.chatId, "⌛ Лобби Супер-игры не набралось за 48 часов. Попробуйте снова — /challenge");
+    }
   }
 }
 
@@ -695,7 +1286,8 @@ function setupStep1Text() {
     "<b>Шаг 1.</b> Выберите уровень сложности слов:\n\n" +
     Object.values(LEVELS)
       .map((l) => `${l.name} — ${l.about} (очки ×${l.mult})`)
-      .join("\n")
+      .join("\n") +
+    "\n\n🔥 Для Супер-игры засчитываются только очки на 🔴 Сложном и 💀 Ультимейте."
   );
 }
 
