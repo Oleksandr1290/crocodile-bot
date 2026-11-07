@@ -13,3 +13,4 @@ new_sqlite_classes = ["CrocodileGame"]
 
 [observability]
 enabled = true
+
