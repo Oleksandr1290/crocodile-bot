@@ -1,5 +1,5 @@
 name = "crocodile-bot"
-main = "src/index.js"
+main = "index.js"
 compatibility_date = "2025-09-01"
 
 # Один Durable Object на каждую группу — хранит раунд, рейтинг и не даёт двум игрокам "угадать одновременно"
