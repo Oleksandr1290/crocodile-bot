@@ -1,0 +1,15 @@
+name = "crocodile-bot"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+# Один Durable Object на каждую группу — хранит раунд, рейтинг и не даёт двум игрокам "угадать одновременно"
+[[durable_objects.bindings]]
+name = "GAME"
+class_name = "CrocodileGame"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CrocodileGame"]
+
+[observability]
+enabled = true
