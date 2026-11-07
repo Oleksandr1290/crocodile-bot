@@ -1,37 +1,60 @@
-// 🐊 «Крокодил» — Telegram-бот для групп (этап 1)
+// 🐊 «Крокодил» — Telegram-бот для групп
 // Cloudflare Workers + Durable Objects: по одному объекту на каждую группу.
 // Объект группы обрабатывает её события строго по очереди, поэтому
 // два игрока не могут "угадать одновременно" и получить очки дважды.
 
 import { DurableObject } from "cloudflare:workers";
-import { WORDS } from "./words.js";
+import { WORDS_BY_LEVEL } from "./words.js";
 
 // ================== НАСТРОЙКИ ==================
-const ROUND_MS = 5 * 60 * 1000;  // время на объяснение слова
-const WAIT_MS = 3 * 60 * 1000;   // сколько ждать, пока кто-то вызовется ведущим
-const MAX_SKIPS = 5;             // сколько раз ведущий может сменить слово
-const RECENT_LIMIT = 150;        // не повторять последние N слов в группе
-const LEADER_PENALTY = 3;        // штраф ведущему, если он сам написал слово
+const LEVELS = {
+  easy: { name: "🟢 Лёгкий", mult: 1, about: "простые предметы, животные, еда" },
+  medium: { name: "🟡 Средний", mult: 1.5, about: "профессии, места, техника" },
+  hard: { name: "🔴 Сложный", mult: 2, about: "редкие слова и понятия" },
+  ultimate: { name: "💀 Ультимейт", mult: 3, about: "абстрактные понятия, для профи" },
+};
+const TIME_OPTIONS = [60, 120, 180, 300, 600];   // варианты времени на слово (сек)
+const UNTIMED_LIMIT_MS = 30 * 60 * 1000;          // "без времени": раунд всё же закроется через 30 мин
+const WAIT_MS = 3 * 60 * 1000;                    // сколько ждать, пока кто-то вызовется ведущим
+const SETUP_MS = 10 * 60 * 1000;                  // сколько ждать завершения настройки
+const MAX_SKIPS = 5;                              // сколько раз ведущий может сменить слово
+const RECENT_LIMIT = 150;                         // не повторять последние N слов в группе
+const LEADER_PENALTY = 3;                         // штраф ведущему, если он сам написал слово
+const DEFAULT_SETTINGS = { level: "medium", timed: true, timeSec: 300 };
 
 const COMMANDS = [
   { command: "game", description: "🐊 Начать игру" },
-  { command: "top", description: "🏆 Рейтинг группы" },
+  { command: "top", description: "🏆 Таблица лидеров группы" },
   { command: "me", description: "📊 Моя статистика" },
-  { command: "stop", description: "🛑 Остановить игру (ведущий или админ)" },
+  { command: "settings", description: "⚙️ Сложность и время (админы)" },
+  { command: "stop", description: "🛑 Остановить игру" },
   { command: "rules", description: "📖 Правила и очки" },
 ];
 
-const RULES_TEXT =
-  "📖 <b>Правила «Крокодила»</b>\n\n" +
-  "1. /game — новый раунд. Кто хочет объяснять, жмёт «🙋 Я буду ведущим».\n" +
-  "2. Ведущий смотрит слово кнопкой «👁» — его видит только он.\n" +
-  "3. Ведущий объясняет в чате, не называя слово и однокоренные. " +
-  `Назвал — раунд аннулируется и −${LEADER_PENALTY} очка.\n` +
-  "4. Остальные пишут догадки. Падежи и мелкие опечатки засчитываются.\n" +
-  `5. На раунд ${ROUND_MS / 60000} минут. Слово можно сменить до ${MAX_SKIPS} раз.\n\n` +
-  "<b>Очки</b>\n" +
-  "🎯 Угадавший: 3, +2 если за 30 сек, +1 если за минуту.\n" +
-  "🎤 Ведущий: 2, +2 если хватило 3 сообщений (+1 если до 6), +1 если угадали за минуту.";
+const HOW_TO_PLAY =
+  "<b>Как играть:</b>\n" +
+  "1. Один игрок становится ведущим и получает секретное слово — его видит только он.\n" +
+  "2. Ведущий объясняет слово в чате, не называя его и однокоренные слова.\n" +
+  "3. Остальные пишут догадки. Падежи и мелкие опечатки засчитываются.\n" +
+  "4. Кто первым угадал — получает очки. Ведущий тоже получает очки за хорошее объяснение.\n" +
+  "5. Очки копятся, у каждой группы своя таблица лидеров — /top.";
+
+function rulesText(s) {
+  s = s || DEFAULT_SETTINGS;
+  return (
+    "📖 <b>Правила «Крокодила»</b>\n\n" +
+    HOW_TO_PLAY +
+    "\n\n" +
+    `⚠️ Если ведущий напишет загаданное слово — раунд аннулируется и −${LEADER_PENALTY} очка.\n` +
+    `🔄 Слово можно сменить до ${MAX_SKIPS} раз.\n\n` +
+    "<b>Очки</b>\n" +
+    "🎯 Угадавший: 3, +2 если за 30 сек, +1 если за минуту.\n" +
+    "🎤 Ведущий: 2, +2 если хватило 3 сообщений (+1 если до 6), +1 если угадали за минуту.\n" +
+    "✖️ Множитель сложности: 🟢 ×1 · 🟡 ×1.5 · 🔴 ×2 · 💀 ×3\n\n" +
+    "<b>Сейчас в группе:</b>\n" +
+    settingsLine(s)
+  );
+}
 
 // ================== ВХОД: WORKER ==================
 export default {
@@ -100,7 +123,7 @@ async function sendPrivateHelp(env, chatId) {
     text:
       "🐊 <b>Привет! Я бот для игры «Крокодил».</b>\n\n" +
       "Добавь меня в группу, сделай админом и напиши там /game.\n\n" +
-      RULES_TEXT,
+      HOW_TO_PLAY,
     reply_markup: username
       ? { inline_keyboard: [[{ text: "➕ Добавить в группу", url: `https://t.me/${username}?startgroup=true` }]] }
       : undefined,
@@ -108,15 +131,17 @@ async function sendPrivateHelp(env, chatId) {
 }
 
 // ================== ИГРА: ОДИН ОБЪЕКТ НА ГРУППУ ==================
-// round.status: "idle" | "waiting" (ждём ведущего) | "playing" | "ended" (подводим итоги)
+// round.status: "idle" | "setup" (настройка) | "waiting" (ждём ведущего) | "playing" | "ended" (подводим итоги)
 export class CrocodileGame extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.round = { status: "idle" };
     this.recent = [];
+    this.settings = null;
     ctx.blockConcurrencyWhile(async () => {
       this.round = (await ctx.storage.get("round")) || { status: "idle" };
       this.recent = (await ctx.storage.get("recent")) || [];
+      this.settings = (await ctx.storage.get("settings")) || null;
     });
   }
 
@@ -147,6 +172,16 @@ export class CrocodileGame extends DurableObject {
       ...extra,
     });
   }
+  edit(chatId, msgId, html, keyboard) {
+    return this.tg("editMessageText", {
+      chat_id: chatId,
+      message_id: msgId,
+      text: html,
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      reply_markup: keyboard || { inline_keyboard: [] },
+    });
+  }
   answer(cq, txt = "", alert = false) {
     return this.tg("answerCallbackQuery", { callback_query_id: cq.id, text: txt.slice(0, 200), show_alert: alert });
   }
@@ -157,28 +192,35 @@ export class CrocodileGame extends DurableObject {
   isActive() {
     return this.round.status === "waiting" || this.round.status === "playing";
   }
+  cfg() {
+    return this.settings || DEFAULT_SETTINGS;
+  }
 
-  async getBotUsername() {
-    let me = await this.ctx.storage.get("me");
+  async getMe() {
+    let me = await this.ctx.storage.get("me2");
     if (!me) {
       const res = await this.tg("getMe", {});
-      me = res.result?.username || null;
-      if (me) await this.ctx.storage.put("me", me);
+      if (res.ok) {
+        me = { id: res.result.id, username: res.result.username };
+        await this.ctx.storage.put("me2", me);
+      }
     }
-    return me;
+    return me || {};
   }
 
   async isAdmin(chatId, userId) {
+    if (!userId) return false;
     const res = await this.tg("getChatMember", { chat_id: chatId, user_id: userId });
     return ["creator", "administrator"].includes(res.result?.status);
   }
 
-  pickWord() {
+  pickWord(level) {
+    const all = WORDS_BY_LEVEL[level] || WORDS_BY_LEVEL.medium;
     const recent = new Set(this.recent);
-    let pool = WORDS.filter((w) => !recent.has(w));
+    let pool = all.filter((w) => !recent.has(w));
     if (!pool.length) {
-      this.recent = [];
-      pool = WORDS;
+      this.recent = this.recent.filter((w) => !all.includes(w));
+      pool = all;
     }
     const w = pool[Math.floor(Math.random() * pool.length)];
     this.recent.push(w);
@@ -194,10 +236,46 @@ export class CrocodileGame extends DurableObject {
     await this.ctx.storage.put(key, s);
   }
 
+  // Таблица лидеров группы (берётся из сохранённой статистики)
+  async topLines(limit) {
+    const all = await this.ctx.storage.list({ prefix: "u:" });
+    const top = [...all.values()]
+      .filter((s) => s.points !== 0 || s.guessed || s.explained)
+      .sort((a, b) => b.points - a.points)
+      .slice(0, limit);
+    const medals = ["🥇", "🥈", "🥉"];
+    return top
+      .map((s, i) => `${medals[i] || i + 1 + "."} <b>${esc(s.name)}</b> — ${s.points} (🎯 ${s.guessed} · 🎤 ${s.explained})`)
+      .join("\n");
+  }
+
+  // Шапка перед новой игрой: настройки + лидеры группы
+  async introHeader() {
+    const top = await this.topLines(5);
+    return (
+      settingsLine(this.cfg()) +
+      (top ? "\n\n🏆 <b>Таблица лидеров группы</b>\n" + top + "\n\nПолный рейтинг — /top" : "\n\n🏆 Таблица лидеров пока пуста — станьте первыми!")
+    );
+  }
+
   // ---------- сообщения ----------
   async onMessage(msg) {
+    const chatId = msg.chat.id;
+
+    // Бота добавили в группу → приветствие, правила и настройка
+    if (msg.new_chat_members?.length) {
+      const me = await this.getMe();
+      if (msg.new_chat_members.some((u) => u.id === me.id)) {
+        if (this.settings) {
+          return this.send(chatId, "🐊 <b>Я снова с вами!</b>\n\n" + (await this.introHeader()) + "\n\nНачать игру — /game");
+        }
+        if (this.round.status === "idle") return this.startSetup(chatId, msg.from?.id || null, true);
+      }
+      return;
+    }
+
     if (!msg.text) return;
-    const anonAdmin = msg.sender_chat?.id === msg.chat.id; // анонимный админ группы
+    const anonAdmin = msg.sender_chat?.id === chatId; // анонимный админ группы
     if (msg.from?.is_bot && !anonAdmin) return;
 
     if (msg.text.startsWith("/")) return this.onCommand(msg, anonAdmin);
@@ -208,31 +286,38 @@ export class CrocodileGame extends DurableObject {
     const first = msg.text.trim().split(/\s+/)[0];
     const [cmdRaw, target] = first.split("@");
     if (target) {
-      const me = await this.getBotUsername();
-      if (me && target.toLowerCase() !== me.toLowerCase()) return; // команда другому боту
+      const me = await this.getMe();
+      if (me.username && target.toLowerCase() !== me.username.toLowerCase()) return; // команда другому боту
     }
     switch (cmdRaw.toLowerCase()) {
       case "/game":
       case "/start":
       case "/croc":
       case "/crocodile":
-        return this.cmdGame(msg);
+        return this.cmdGame(msg, anonAdmin);
       case "/top":
         return this.cmdTop(msg);
       case "/me":
       case "/stats":
         return this.cmdMe(msg);
+      case "/settings":
+        return this.cmdSettings(msg, anonAdmin);
       case "/stop":
         return this.cmdStop(msg, anonAdmin);
       case "/rules":
       case "/help":
-        return this.send(msg.chat.id, RULES_TEXT);
+        return this.send(msg.chat.id, rulesText(this.cfg()));
     }
   }
 
-  async cmdGame(msg) {
+  async cmdGame(msg, anonAdmin) {
     const r = this.round;
     const chatId = msg.chat.id;
+    if (r.status === "setup") {
+      return this.send(chatId, "⚙️ Сейчас идёт настройка — выберите варианты в сообщении выше ☝️", {
+        reply_parameters: { message_id: r.msgId, allow_sending_without_reply: true },
+      });
+    }
     if (r.status === "waiting") {
       return this.send(chatId, "☝️ Раунд уже ждёт ведущего — нажми «🙋 Я буду ведущим».", {
         reply_parameters: { message_id: r.msgId, allow_sending_without_reply: true },
@@ -242,10 +327,103 @@ export class CrocodileGame extends DurableObject {
       return this.send(chatId, `🎤 Сейчас объясняет <b>${esc(r.leaderName)}</b> — угадывайте!`);
     }
     if (r.status === "ended") return; // прямо сейчас подводятся итоги
-    return this.openRound(chatId, "");
+
+    // Первый запуск в группе → правила + настройка
+    if (!this.settings) return this.startSetup(chatId, anonAdmin ? null : msg.from?.id, true);
+    return this.openRound(chatId, await this.introHeader());
   }
 
-  // Новый раунд: сообщение с кнопкой «Я буду ведущим». header — итоги прошлого раунда.
+  // ---------- настройка: сложность → режим → время ----------
+  async startSetup(chatId, initiatorId, welcome) {
+    const old = this.round;
+    const r = { status: "setup", chatId, initiatorId: initiatorId || null, draft: {}, msgId: null, deadline: Date.now() + SETUP_MS };
+    this.round = r;
+    await this.save();
+    if (old.msgId && old.status === "waiting") await this.removeButtons(chatId, old.msgId);
+
+    const intro = welcome
+      ? "🐊 <b>Привет! Я бот для игры «Крокодил».</b>\n\n" + HOW_TO_PLAY + "\n\nДавайте настроим игру 👇\n\n"
+      : "⚙️ <b>Настройка игры</b>\n\n";
+    const res = await this.send(chatId, intro + setupStep1Text(), { reply_markup: levelKeyboard() });
+    if (this.round !== r) return;
+    if (!res.ok) {
+      this.round = { status: "idle" };
+      await this.save();
+      return;
+    }
+    r.msgId = res.result.message_id;
+    await this.save();
+    await this.ctx.storage.setAlarm(r.deadline);
+  }
+
+  async handleSetup(cq) {
+    const r = this.round;
+    const uid = cq.from.id;
+    if (r.initiatorId && uid !== r.initiatorId && !(await this.isAdmin(r.chatId, uid))) {
+      return this.answer(cq, "Настраивает тот, кто запустил игру, или админ группы 🙂", true);
+    }
+    if (this.round !== r || r.status !== "setup") return this.answer(cq);
+
+    const [key, val] = String(cq.data).split(":");
+
+    if (key === "d" && LEVELS[val]) {
+      r.draft.level = val;
+      r.deadline = Date.now() + SETUP_MS;
+      await this.save();
+      await this.answer(cq, LEVELS[val].name);
+      return this.edit(r.chatId, r.msgId, setupStep2Text(r.draft), modeKeyboard());
+    }
+
+    if (key === "m" && r.draft.level) {
+      if (val === "free") return this.finishSetup(cq, { level: r.draft.level, timed: false });
+      r.draft.timed = true;
+      r.deadline = Date.now() + SETUP_MS;
+      await this.save();
+      await this.answer(cq, "⏱ На время");
+      return this.edit(r.chatId, r.msgId, setupStep3Text(r.draft), timeKeyboard());
+    }
+
+    if (key === "t" && r.draft.level && TIME_OPTIONS.includes(Number(val))) {
+      return this.finishSetup(cq, { level: r.draft.level, timed: true, timeSec: Number(val) });
+    }
+
+    if (key === "back") {
+      r.draft = {};
+      await this.save();
+      await this.answer(cq);
+      return this.edit(r.chatId, r.msgId, "⚙️ <b>Настройка игры</b>\n\n" + setupStep1Text(), levelKeyboard());
+    }
+
+    return this.answer(cq);
+  }
+
+  async finishSetup(cq, s) {
+    const r = this.round;
+    r.status = "ended"; // сразу, чтобы двойное нажатие не сработало
+    this.settings = s;
+    await this.ctx.storage.put("settings", s);
+    await this.save();
+    await this.answer(cq, "Настройки сохранены ✅");
+    await this.edit(r.chatId, r.msgId, "✅ <b>Игра настроена!</b>\n" + settingsLine(s) + "\n\nИзменить настройки — /settings (админы)");
+    return this.openRound(r.chatId, await this.introHeader());
+  }
+
+  async cmdSettings(msg, anonAdmin) {
+    const chatId = msg.chat.id;
+    if (this.round.status === "playing") {
+      return this.send(chatId, "Сейчас идёт раунд. Поменять настройки можно после него (или остановите игру — /stop).");
+    }
+    if (this.round.status === "ended") return;
+    // Первую настройку может сделать любой, менять потом — только админы
+    if (this.settings && !anonAdmin && !(await this.isAdmin(chatId, msg.from?.id))) {
+      return this.send(chatId, "⚙️ Менять настройки могут только админы группы.\n\nСейчас: " + settingsLine(this.cfg()));
+    }
+    if (this.round.status === "playing" || this.round.status === "ended") return;
+    return this.startSetup(chatId, anonAdmin ? null : msg.from?.id, false);
+  }
+
+  // ---------- раунд ----------
+  // Новый раунд: сообщение с кнопкой «Я буду ведущим». header — итоги прошлого раунда / лидеры.
   async openRound(chatId, header = "", oldMsgId = null) {
     const r = { status: "waiting", chatId, header, msgId: null, deadline: Date.now() + WAIT_MS };
     this.round = r; // сначала меняем состояние, потом всё остальное
@@ -268,20 +446,18 @@ export class CrocodileGame extends DurableObject {
 
   async renderPlaying() {
     const r = this.round;
-    await this.tg("editMessageText", {
-      chat_id: r.chatId,
-      message_id: r.msgId,
-      parse_mode: "HTML",
-      text:
-        (r.header ? r.header + "\n\n" : "") +
+    await this.edit(
+      r.chatId,
+      r.msgId,
+      (r.header ? r.header + "\n\n" : "") +
         `🎤 Ведущий: <b>${esc(r.leaderName)}</b>\n` +
         "Объясняет слово — пишите догадки прямо в чат!\n" +
-        `⏱ На раунд ${ROUND_MS / 60000} мин.`,
-      reply_markup: kb([
+        `${LEVELS[r.level]?.name || ""} · ${r.timed ? "⏱ " + fmtTime(r.roundMs / 1000) + " на слово" : "♾ Без ограничения времени"}`,
+      kb([
         [["👁 Посмотреть слово", "word"]],
         [["🔄 Другое слово", "skip"], ["🏳 Сдаюсь", "giveup"]],
-      ]),
-    });
+      ])
+    );
   }
 
   // Текст в чате во время раунда
@@ -310,15 +486,19 @@ export class CrocodileGame extends DurableObject {
     r.status = "ended";
     const sec = Math.max(1, Math.round((Date.now() - r.startedAt) / 1000));
     const gName = displayName(msg.from);
+    const mult = LEVELS[r.level]?.mult || 1;
 
-    let gp = 3;
-    if (sec <= 30) gp += 2;
-    else if (sec <= 60) gp += 1;
+    let gBase = 3;
+    if (sec <= 30) gBase += 2;
+    else if (sec <= 60) gBase += 1;
 
-    let lp = 2;
-    if (r.leaderMsgs <= 3) lp += 2;
-    else if (r.leaderMsgs <= 6) lp += 1;
-    if (sec <= 60) lp += 1;
+    let lBase = 2;
+    if (r.leaderMsgs <= 3) lBase += 2;
+    else if (r.leaderMsgs <= 6) lBase += 1;
+    if (sec <= 60) lBase += 1;
+
+    const gp = Math.round(gBase * mult);
+    const lp = Math.round(lBase * mult);
 
     await this.addStats(msg.from.id, gName, { points: gp, guessed: 1 });
     await this.addStats(r.leaderId, r.leaderName, { points: lp, explained: 1 });
@@ -331,7 +511,8 @@ export class CrocodileGame extends DurableObject {
     const header =
       `🎉 <b>${esc(gName)}</b> угадал(а) слово <b>${upper(r.word)}</b> за ${fmtTime(sec)}!\n` +
       `🎯 ${esc(gName)}: +${gp} ${plural(gp, "очко", "очка", "очков")}\n` +
-      `🎤 ${esc(r.leaderName)}: +${lp} ${plural(lp, "очко", "очка", "очков")} (сообщений: ${r.leaderMsgs})`;
+      `🎤 ${esc(r.leaderName)}: +${lp} ${plural(lp, "очко", "очка", "очков")} (сообщений: ${r.leaderMsgs})` +
+      (mult > 1 ? `\n✖️ Бонус сложности ×${mult}` : "");
     return this.openRound(r.chatId, header, r.msgId);
   }
 
@@ -339,27 +520,35 @@ export class CrocodileGame extends DurableObject {
   async onCallback(cq) {
     const r = this.round;
     const msgId = cq.message?.message_id;
-    if (!this.isActive() || !r.msgId || msgId !== r.msgId) {
-      await this.answer(cq, "⌛ Этот раунд уже закончился. Новая игра — /game");
+    const valid = r.msgId && msgId === r.msgId && (this.isActive() || r.status === "setup");
+    if (!valid) {
+      await this.answer(cq, "⌛ Это сообщение уже неактуально. Новая игра — /game");
       if (cq.message && msgId !== r.msgId) await this.removeButtons(cq.message.chat.id, msgId);
       return;
     }
+
+    if (r.status === "setup") return this.handleSetup(cq);
 
     const isLeader = r.status === "playing" && cq.from.id === r.leaderId;
 
     switch (cq.data) {
       case "lead": {
         if (r.status !== "waiting") return this.answer(cq, "Ведущий уже выбран 🙂");
-        const word = this.pickWord();
+        const s = this.cfg();
+        const roundMs = s.timed ? s.timeSec * 1000 : UNTIMED_LIMIT_MS;
+        const word = this.pickWord(s.level);
         Object.assign(r, {
           status: "playing",
           leaderId: cq.from.id,
           leaderName: displayName(cq.from),
           word,
+          level: s.level,
+          timed: s.timed,
+          roundMs,
           skips: 0,
           leaderMsgs: 0,
           startedAt: Date.now(),
-          deadline: Date.now() + ROUND_MS,
+          deadline: Date.now() + roundMs,
         });
         await this.save();
         await this.answer(cq, wordAlert(word), true);
@@ -377,11 +566,11 @@ export class CrocodileGame extends DurableObject {
       case "skip": {
         if (!isLeader) return this.answer(cq, "Менять слово может только ведущий", true);
         if (r.skips >= MAX_SKIPS) return this.answer(cq, "Больше менять слово нельзя — объясняй это 💪", true);
-        r.word = this.pickWord();
+        r.word = this.pickWord(r.level);
         r.skips++;
         r.leaderMsgs = 0;
         r.startedAt = Date.now();
-        r.deadline = Date.now() + ROUND_MS;
+        r.deadline = Date.now() + r.roundMs;
         await this.save();
         await this.ctx.storage.setAlarm(r.deadline);
         return this.answer(cq, `🔄 Новое слово: ${upper(r.word)}\n\nОсталось смен: ${MAX_SKIPS - r.skips}`, true);
@@ -403,19 +592,9 @@ export class CrocodileGame extends DurableObject {
 
   // ---------- команды ----------
   async cmdTop(msg) {
-    const chatId = msg.chat.id;
-    const all = await this.ctx.storage.list({ prefix: "u:" });
-    const top = [...all.values()]
-      .filter((s) => s.points !== 0 || s.guessed || s.explained)
-      .sort((a, b) => b.points - a.points)
-      .slice(0, 10);
-    if (!top.length) return this.send(chatId, "🏆 Рейтинг пока пуст. Сыграйте — /game");
-
-    const medals = ["🥇", "🥈", "🥉"];
-    const lines = top.map(
-      (s, i) => `${medals[i] || i + 1 + "."} <b>${esc(s.name)}</b> — ${s.points} (🎯 ${s.guessed} · 🎤 ${s.explained})`
-    );
-    return this.send(chatId, "🏆 <b>Топ игроков группы</b>\n\n" + lines.join("\n") + "\n\n🎯 угадал · 🎤 объяснил");
+    const lines = await this.topLines(10);
+    if (!lines) return this.send(msg.chat.id, "🏆 Таблица лидеров пока пуста. Сыграйте — /game");
+    return this.send(msg.chat.id, "🏆 <b>Таблица лидеров группы</b>\n\n" + lines + "\n\n🎯 угадал · 🎤 объяснил");
   }
 
   async cmdMe(msg) {
@@ -438,28 +617,47 @@ export class CrocodileGame extends DurableObject {
 
   async cmdStop(msg, anonAdmin) {
     const chatId = msg.chat.id;
-    if (!this.isActive()) return this.send(chatId, "Сейчас нет активной игры. Начать — /game");
+    const st = this.round.status;
+    if (st !== "waiting" && st !== "playing" && st !== "setup") {
+      return this.send(chatId, "Сейчас нет активной игры. Начать — /game");
+    }
 
-    const isLeader = this.round.status === "playing" && msg.from?.id === this.round.leaderId;
-    const allowed = isLeader || anonAdmin || (await this.isAdmin(chatId, msg.from.id));
+    const uid = msg.from?.id;
+    const isLeader = st === "playing" && uid === this.round.leaderId;
+    const isInitiator = st === "setup" && uid && uid === this.round.initiatorId;
+    const allowed = isLeader || isInitiator || anonAdmin || (await this.isAdmin(chatId, uid));
     if (!allowed) return this.send(chatId, "🛑 Остановить игру может ведущий или админ группы.");
 
     const cur = this.round;
-    if (!this.isActive()) return; // пока проверяли права, раунд уже закончился
+    if (!["waiting", "playing", "setup"].includes(cur.status)) return; // пока проверяли права, всё уже закончилось
     const word = cur.status === "playing" ? cur.word : null;
     this.round = { status: "idle" };
     await this.save();
     await this.ctx.storage.deleteAlarm();
     await this.removeButtons(chatId, cur.msgId);
-    return this.send(chatId, "🛑 Игра остановлена." + (word ? `\nСлово было: <b>${upper(word)}</b>` : "") + "\nНовая игра — /game");
+    const top = await this.topLines(5);
+    return this.send(
+      chatId,
+      "🛑 Игра остановлена." +
+        (word ? `\nСлово было: <b>${upper(word)}</b>` : "") +
+        (top ? "\n\n🏆 <b>Таблица лидеров группы</b>\n" + top : "") +
+        "\n\nНовая игра — /game"
+    );
   }
 
   // ---------- таймер ----------
   async alarm() {
     const r = this.round;
-    if (!this.isActive()) return;
+    if (!["waiting", "playing", "setup"].includes(r.status)) return;
     if (Date.now() < r.deadline - 1000) {
       await this.ctx.storage.setAlarm(r.deadline);
+      return;
+    }
+
+    if (r.status === "setup") {
+      this.round = { status: "idle" };
+      await this.save();
+      if (r.msgId) await this.edit(r.chatId, r.msgId, "⌛ Настройка не завершена. Начать заново — /game");
       return;
     }
 
@@ -467,20 +665,76 @@ export class CrocodileGame extends DurableObject {
       this.round = { status: "idle" };
       await this.save();
       if (r.msgId) {
-        await this.tg("editMessageText", {
-          chat_id: r.chatId,
-          message_id: r.msgId,
-          parse_mode: "HTML",
-          text: (r.header ? r.header + "\n\n" : "") + "😴 Никто не вызвался вести. Сыграть ещё — /game",
-          reply_markup: { inline_keyboard: [] },
-        });
+        const top = await this.topLines(5);
+        await this.edit(
+          r.chatId,
+          r.msgId,
+          (r.header ? r.header + "\n\n" : "") +
+            "😴 Никто не вызвался вести — игра на паузе." +
+            (top && !r.header.includes("Таблица лидеров") ? "\n\n🏆 <b>Таблица лидеров группы</b>\n" + top : "") +
+            "\n\nСыграть ещё — /game"
+        );
       }
       return;
     }
 
     r.status = "ended";
-    return this.openRound(r.chatId, `⏰ Время вышло — никто не угадал.\nСлово было: <b>${upper(r.word)}</b>`, r.msgId);
+    const why = r.timed ? "⏰ Время вышло — никто не угадал." : "⏰ Раунд закрыт: 30 минут никто не угадал.";
+    return this.openRound(r.chatId, `${why}\nСлово было: <b>${upper(r.word)}</b>`, r.msgId);
   }
+}
+
+// ================== ТЕКСТЫ И КНОПКИ НАСТРОЙКИ ==================
+function settingsLine(s) {
+  const lvl = LEVELS[s.level] || LEVELS.medium;
+  return `⚙️ Сложность: ${lvl.name} · ${s.timed ? "⏱ " + fmtTime(s.timeSec) + " на слово" : "♾ Без ограничения времени"}`;
+}
+
+function setupStep1Text() {
+  return (
+    "<b>Шаг 1.</b> Выберите уровень сложности слов:\n\n" +
+    Object.values(LEVELS)
+      .map((l) => `${l.name} — ${l.about} (очки ×${l.mult})`)
+      .join("\n")
+  );
+}
+
+function setupStep2Text(d) {
+  return (
+    "⚙️ <b>Настройка игры</b>\n\n" +
+    `Сложность: ${LEVELS[d.level].name} ✅\n\n` +
+    "<b>Шаг 2.</b> Как играем?\n\n" +
+    "⏱ <b>На время</b> — на каждое слово даётся ограниченное время.\n" +
+    "♾ <b>Без времени</b> — объясняем, пока кто-то не угадает."
+  );
+}
+
+function setupStep3Text(d) {
+  return (
+    "⚙️ <b>Настройка игры</b>\n\n" +
+    `Сложность: ${LEVELS[d.level].name} ✅\n` +
+    "Режим: ⏱ На время ✅\n\n" +
+    "<b>Шаг 3.</b> Сколько времени даётся на угадывание одного слова?"
+  );
+}
+
+function levelKeyboard() {
+  return kb([
+    [[LEVELS.easy.name, "d:easy"], [LEVELS.medium.name, "d:medium"]],
+    [[LEVELS.hard.name, "d:hard"], [LEVELS.ultimate.name, "d:ultimate"]],
+  ]);
+}
+
+function modeKeyboard() {
+  return kb([
+    [["⏱ На время", "m:timed"], ["♾ Без времени", "m:free"]],
+    [["⬅️ Назад", "back"]],
+  ]);
+}
+
+function timeKeyboard() {
+  const btns = TIME_OPTIONS.map((sec) => [fmtTime(sec), "t:" + sec]);
+  return kb([btns.slice(0, 3), btns.slice(3), [["⬅️ Назад", "back"]]]);
 }
 
 // ================== ПОМОЩНИКИ ==================
@@ -526,6 +780,7 @@ function wordAlert(w) {
 }
 
 function fmtTime(sec) {
+  sec = Math.round(sec);
   if (sec < 60) return `${sec} сек`;
   const m = Math.floor(sec / 60);
   const s = sec % 60;
