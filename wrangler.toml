@@ -2,14 +2,23 @@ name = "crocodile-bot"
 main = "index.js"
 compatibility_date = "2025-09-01"
 
-# Один Durable Object на каждую группу — хранит раунд, рейтинг и не даёт двум игрокам "угадать одновременно"
+# Один объект на каждую группу — раунд, рейтинг, защита от "одновременных" ответов
 [[durable_objects.bindings]]
 name = "GAME"
 class_name = "CrocodileGame"
 
+# Общий реестр всех групп и лобби Супер-игры (один на весь бот)
+[[durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "ArenaRegistry"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["CrocodileGame"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["ArenaRegistry"]
 
 [observability]
 enabled = true
