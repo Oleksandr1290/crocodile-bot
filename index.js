@@ -42,6 +42,7 @@ const COMMANDS = [
   { command: "settings", description: "⚙️ Сложность и время (админы)" },
   { command: "catalog", description: "📋 Показать группу в каталоге игр (админы)" },
   { command: "moderation", description: "🛡 Фильтр мата, рекламы и ссылок (админы)" },
+  { command: "alive", description: "🌱 Живая группа: загадка дня, вечерняя игра (админы)" },
   { command: "stop", description: "🛑 Остановить игру" },
   { command: "rules", description: "📖 Правила и очки" },
 ];
@@ -51,6 +52,21 @@ const PRIVATE_COMMANDS = [
   { command: "myid", description: "🆔 Мой Telegram ID" },
 ];
 const CATALOG_PAGE = 8; // групп на одной странице каталога
+
+// ================== ЖИВАЯ ГРУППА (расписание) ==================
+// Время — по Москве (UTC+3). Можно поменять переменной ALIVE_TZ в Cloudflare (например 2 для Бухареста/Киева зимой)
+const tzOffset = (env) => (env.ALIVE_TZ !== undefined && env.ALIVE_TZ !== "" ? Number(env.ALIVE_TZ) : 3);
+const RIDDLE_HOURS = { start: 10, hint2: 14, hint3: 18, reveal: 22 };
+const EVENING_HOUR = 20;
+const WEEKLY = { dow: 0, hour: 21 };          // воскресенье 21:00
+const NUDGE = { from: 12, to: 21, silenceMs: 4 * 3600 * 1000, everyMs: 6 * 3600 * 1000 };
+const DEAD_MS = 3 * 24 * 3600 * 1000;           // группа молчит 3 дня — не беспокоим (кроме официальной)
+const RIDDLE_POINTS = 5;
+const MIN_ACTIVE = 3;                  // минимум разных людей, писавших за 7 дней, чтобы звать на игру
+const MIN_ACTIVE_RIDDLE = 2;           // для загадки дня хватит двоих
+const ACTIVE_WINDOW_MS = 7 * 24 * 3600 * 1000;
+const GATHER_NEED = 3;                 // сколько игроков нужно собрать, чтобы начать
+const GATHER_MS = 15 * 60 * 1000;      // сколько ждать сбора
 
 // ================== МОДЕРАЦИЯ ==================
 const MAX_WARNS = 3;                          // 1 — предупреждение, 2 — мут, 3 — бан
@@ -159,7 +175,26 @@ export default {
 
     return text("🐊 Crocodile bot работает");
   },
+
+  // Каждый час (cron): оживляем группы
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runTick(env));
+  },
 };
+
+async function runTick(env) {
+  const local = new Date(Date.now() + tzOffset(env) * 3600 * 1000);
+  const tick = { hour: local.getUTCHours(), dow: local.getUTCDay(), day: local.toISOString().slice(0, 10) };
+  const res = await registry(env, "alive_groups", {});
+  for (const chatId of res.chats || []) {
+    try {
+      const stub = env.GAME.get(env.GAME.idFromName(String(chatId)));
+      await stub.fetch("https://game/tick", { method: "POST", body: JSON.stringify(tick) });
+    } catch (e) {
+      console.log("tick failed", chatId, String(e));
+    }
+  }
+}
 
 async function handlePrivate(env, msg) {
   const cmd = msg.text.trim().split(/\s+/)[0].split("@")[0].toLowerCase();
@@ -269,6 +304,8 @@ export class CrocodileGame extends DurableObject {
     this.isArena = false;    // эта группа — Арена Супер-игры
     this.allowed = new Set(); // ID участников Супер-игры (только для Арены)
     this.mod = { on: false };  // модерация: мат, реклама, ссылки
+    this.alive = { on: false }; // живая группа: расписание событий
+    this.lastAct = 0;           // когда последний раз писали люди
     this.admins = null;        // кэш админов группы
     this.adminsAt = 0;
     ctx.blockConcurrencyWhile(async () => {
@@ -279,6 +316,9 @@ export class CrocodileGame extends DurableObject {
       this.isArena = !!(await ctx.storage.get("arena"));
       this.allowed = new Set((await ctx.storage.get("allowed")) || []);
       this.mod = (await ctx.storage.get("mod")) || { on: false };
+      this.alive = (await ctx.storage.get("alive")) || { on: false };
+      this.lastAct = (await ctx.storage.get("lastAct")) || 0;
+      this.act = (await ctx.storage.get("act")) || {}; // кто когда писал: { userId: время }
     });
   }
 
@@ -287,6 +327,7 @@ export class CrocodileGame extends DurableObject {
     const body = await request.json();
     try {
       if (path === "/allow") return Response.json(await this.allowPlayers(body.ids || []));
+      if (path === "/tick") return Response.json(await this.onTick(body));
       await this.rememberChat(
         body.message?.chat || body.callback_query?.message?.chat || body.chat_join_request?.chat || body.my_chat_member?.chat
       );
@@ -340,7 +381,11 @@ export class CrocodileGame extends DurableObject {
     return this.tg("editMessageReplyMarkup", { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [] } });
   }
   isActive() {
-    return this.round.status === "waiting" || this.round.status === "playing";
+    return this.round.status === "waiting" || this.round.status === "playing" || this.round.status === "gather";
+  }
+  activeCount() {
+    const now = Date.now();
+    return Object.values(this.act || {}).filter((t) => now - t < ACTIVE_WINDOW_MS).length;
   }
   cfg() {
     if (this.isArena) return ARENA_SETTINGS;
@@ -400,6 +445,16 @@ export class CrocodileGame extends DurableObject {
   }
 
   async addStats(userId, name, delta) {
+    if (!this.isArena && delta.points) {
+      const wid = weekId(this.env);
+      let wk = (await this.ctx.storage.get("week")) || { id: wid, p: {} };
+      if (wk.id !== wid) wk = { id: wid, p: {} };
+      const e = wk.p[userId] || { name, points: 0 };
+      e.name = name;
+      e.points += delta.points;
+      wk.p[userId] = e;
+      await this.ctx.storage.put("week", wk);
+    }
     const keys = ["u:" + userId];
     if (this.isArena) keys.push("m:" + userId); // отдельный зачёт текущего матча Арены
     for (const key of keys) {
@@ -439,6 +494,7 @@ export class CrocodileGame extends DurableObject {
       title: this.meta.title,
       username: this.meta.username || "",
       level: (this.settings || DEFAULT_SETTINGS).level,
+      alive: !!this.alive.on,
       players: players.length,
       leader: top ? { id: top.id, name: top.name, points: top.points, hardPoints: top.hardPoints || 0 } : null,
     };
@@ -560,11 +616,29 @@ export class CrocodileGame extends DurableObject {
       if (why) return this.punish(msg, why);
     }
 
+    if (msg.from && !msg.from.is_bot) {
+      const now = Date.now();
+      if (now - this.lastAct > 5 * 60 * 1000) {
+        this.lastAct = now;
+        await this.ctx.storage.put("lastAct", now);
+      }
+      if (now - (this.act[msg.from.id] || 0) > 10 * 60 * 1000) {
+        this.act[msg.from.id] = now;
+        for (const [id, t] of Object.entries(this.act)) if (now - t > ACTIVE_WINDOW_MS) delete this.act[id];
+        await this.ctx.storage.put("act", this.act);
+      }
+    }
+
     if (!msg.text) return;
     if (msg.from?.is_bot && !anonAdmin) return;
 
     if (msg.text.startsWith("/")) return this.onCommand(msg, anonAdmin);
-    if (this.round.status === "playing" && !msg.from?.is_bot) return this.onPlayingText(msg);
+    if (this.round.status === "playing" && !msg.from?.is_bot) {
+      const before = this.round;
+      await this.onPlayingText(msg);
+      if (this.round !== before || before.status !== "playing") return; // сообщение ушло в раунд
+    }
+    if (!msg.from?.is_bot) return this.checkRiddle(msg);
   }
 
   async onCommand(msg, anonAdmin) {
@@ -598,6 +672,8 @@ export class CrocodileGame extends DurableObject {
         return this.cmdCatalog(msg, anonAdmin);
       case "/moderation":
         return this.cmdModeration(msg, anonAdmin);
+      case "/alive":
+        return this.cmdAlive(msg, anonAdmin);
       case "/official":
         return this.cmdOfficial(msg);
       case "/arena_here":
@@ -617,6 +693,11 @@ export class CrocodileGame extends DurableObject {
       return this.send(chatId, "⚙️ Сейчас идёт настройка — выберите варианты в сообщении выше ☝️", {
         reply_parameters: { message_id: r.msgId, allow_sending_without_reply: true },
       });
+    }
+    if (r.status === "gather") {
+      // кто-то хочет играть прямо сейчас — не ждём сбора
+      r.status = "ended";
+      return this.openRound(chatId, r.header, r.msgId);
     }
     if (r.status === "waiting") {
       return this.send(chatId, "☝️ Раунд уже ждёт ведущего — нажми «🙋 Я буду ведущим».", {
@@ -847,6 +928,7 @@ export class CrocodileGame extends DurableObject {
     if (data === "chal" || data.startsWith("acc:")) return this.onArenaCallback(cq, data);
     if (data.startsWith("catl:")) return this.onCatalogCallback(cq, data);
     if (data.startsWith("mod:")) return this.onModerationCallback(cq, data);
+    if (data.startsWith("alive:")) return this.onAliveCallback(cq, data);
 
     const r = this.round;
     const msgId = cq.message?.message_id;
@@ -860,6 +942,9 @@ export class CrocodileGame extends DurableObject {
     if (r.status === "setup") return this.handleSetup(cq);
 
     const isLeader = r.status === "playing" && cq.from.id === r.leaderId;
+
+    if (data === "join") return this.onGatherJoin(cq);
+    if (r.status === "gather") return this.answer(cq);
 
     switch (data) {
       case "lead": {
@@ -947,6 +1032,209 @@ export class CrocodileGame extends DurableObject {
     if (!msg.from || msg.from.is_bot) return;
     const res = await this.registry("challenge", { snap: await this.snapshot(), userId: msg.from.id });
     return this.send(chatId, res.text);
+  }
+
+  // ---------- живая группа ----------
+  aliveText() {
+    const tz = tzOffset(this.env);
+    return (
+      "🌱 <b>Живая группа</b>\n\n" +
+      "Сейчас: " + (this.alive.on ? "✅ <b>включено</b>" : "🚫 <b>выключено</b>") +
+      `\n\nКогда включено, бот сам оживляет чат (время UTC${tz >= 0 ? "+" : ""}${tz}):\n` +
+      `🧩 ${RIDDLE_HOURS.start}:00 — загадка дня (подсказки в ${RIDDLE_HOURS.hint2}:00 и ${RIDDLE_HOURS.hint3}:00, ответ в ${RIDDLE_HOURS.reveal}:00)\n` +
+      `🌙 ${EVENING_HOUR}:00 — сбор на вечернюю игру (старт, когда нажмут ${GATHER_NEED} человека)\n` +
+      "😴 если днём 4 часа тишины — предложит собраться\n" +
+      `🏆 воскресенье ${WEEKLY.hour}:00 — итоги недели и Игрок недели 👑\n\n` +
+      `Бот зовёт играть, только если за неделю в группе писали минимум ${MIN_ACTIVE} разных человека ` +
+      `(загадке дня хватит ${MIN_ACTIVE_RIDDLE}). Если 3 дня тишина — не беспокоит совсем.\n\n` +
+      `Сейчас активных за неделю: ${this.activeCount()}`
+    );
+  }
+
+  async cmdAlive(msg, anonAdmin) {
+    const chatId = msg.chat.id;
+    if (this.isArena) return;
+    if (!anonAdmin && !this.isOwner(msg.from?.id) && !(await this.isAdmin(chatId, msg.from?.id))) {
+      return this.send(chatId, "🌱 Включать «Живую группу» могут только админы.");
+    }
+    return this.send(chatId, this.aliveText(), {
+      reply_markup: kb([[this.alive.on ? ["🚫 Выключить", "alive:off"] : ["✅ Включить", "alive:on"]]]),
+    });
+  }
+
+  async onAliveCallback(cq, data) {
+    const chatId = cq.message.chat.id;
+    if (!this.isOwner(cq.from.id) && !(await this.isAdmin(chatId, cq.from.id))) return this.answer(cq, "Только для админов группы", true);
+    this.alive = { on: data === "alive:on" };
+    await this.ctx.storage.put("alive", this.alive);
+    await this.report();
+    await this.answer(cq, this.alive.on ? "🌱 Живая группа включена" : "Выключено");
+    return this.edit(chatId, cq.message.message_id, this.aliveText(), kb([[this.alive.on ? ["🚫 Выключить", "alive:off"] : ["✅ Включить", "alive:on"]]]));
+  }
+
+  // Вызывается каждый час (cron)
+  async onTick({ hour, dow, day }) {
+    if (!this.alive.on || this.isArena || !this.meta.chatId) return { ok: true };
+    const chatId = this.meta.chatId;
+    const official = (await this.registry("is_official", { chatId })).official;
+    const dead = !official && Date.now() - this.lastAct > DEAD_MS;
+
+    let done = (await this.ctx.storage.get("ticks")) || { day, list: [] };
+    if (done.day !== day) done = { day, list: [] };
+    const once = async (tag, fn) => {
+      if (done.list.includes(tag)) return;
+      done.list.push(tag);
+      await this.ctx.storage.put("ticks", done);
+      await fn();
+    };
+
+    const active = this.activeCount();
+
+    // 🧩 Загадка дня — если в группе за неделю писали хотя бы двое
+    if (hour === RIDDLE_HOURS.start && !dead && active >= MIN_ACTIVE_RIDDLE) await once("riddle", () => this.startRiddle(day));
+    if (hour === RIDDLE_HOURS.hint2) await once("hint2", () => this.riddleHint(2));
+    if (hour === RIDDLE_HOURS.hint3) await once("hint3", () => this.riddleHint(3));
+    if (hour === RIDDLE_HOURS.reveal) await once("reveal", () => this.revealRiddle());
+
+    // 🌙 Вечерняя игра — сбор игроков (официальная группа зовёт всегда, остальные — если есть кому играть)
+    if (hour === EVENING_HOUR && !dead && this.round.status === "idle" && this.settings && (official || active >= MIN_ACTIVE)) {
+      await once("evening", () => this.startGather(chatId, "🌙 <b>Вечерний Крокодил!</b> Кто сегодня играет? 🎮"));
+    }
+
+    // 🏆 Итоги недели
+    if (dow === WEEKLY.dow && hour === WEEKLY.hour) await once("weekly", () => this.weeklySummary());
+
+    // 😴 Тишина днём
+    const lastNudge = (await this.ctx.storage.get("lastNudge")) || 0;
+    if (
+      hour >= NUDGE.from && hour <= NUDGE.to && hour !== EVENING_HOUR && !dead && this.settings && active >= MIN_ACTIVE &&
+      this.round.status === "idle" && Date.now() - this.lastAct > NUDGE.silenceMs && Date.now() - lastNudge > NUDGE.everyMs
+    ) {
+      await this.ctx.storage.put("lastNudge", Date.now());
+      const phrases = [
+        "😴 Что-то тихо в чате… Сыграем в Крокодила?",
+        "🐊 Крокодил заскучал! Кто за пару раундов?",
+        "🎮 Минутка на игру? Собираем команду!",
+        "🧠 Проверим, кто тут самый сообразительный? Кто играет?",
+      ];
+      await this.startGather(chatId, phrases[Math.floor(Math.random() * phrases.length)]);
+    }
+    return { ok: true };
+  }
+
+  // ---------- сбор игроков ----------
+  gatherText(r) {
+    const names = r.players.map((p) => esc(p.name)).join(", ");
+    return (
+      `${r.header}\n\n` +
+      `Чтобы начать, нужно минимум <b>${GATHER_NEED}</b> игрока. Жми кнопку, если в деле!\n` +
+      `⏳ Сбор открыт ${Math.round(GATHER_MS / 60000)} минут.` +
+      (names ? `\n\n🙋 Уже играют: ${names}` : "")
+    );
+  }
+  gatherKeyboard(r) {
+    return kb([[[`🙋 Я играю (${r.players.length}/${GATHER_NEED})`, "join"]]]);
+  }
+
+  async startGather(chatId, header) {
+    const r = { status: "gather", chatId, header, players: [], msgId: null, deadline: Date.now() + GATHER_MS };
+    this.round = r;
+    await this.save();
+    const res = await this.send(chatId, this.gatherText(r), { reply_markup: this.gatherKeyboard(r) });
+    if (this.round !== r) return;
+    if (!res.ok) {
+      this.round = { status: "idle" };
+      return this.save();
+    }
+    r.msgId = res.result.message_id;
+    await this.save();
+    await this.ctx.storage.setAlarm(r.deadline);
+  }
+
+  async onGatherJoin(cq) {
+    const r = this.round;
+    if (r.status !== "gather") return this.answer(cq, "Сбор уже закончился");
+    if (r.players.some((p) => p.id === cq.from.id)) return this.answer(cq, "Ты уже в игре 👍");
+    r.players.push({ id: cq.from.id, name: displayName(cq.from) });
+    if (r.players.length >= GATHER_NEED) {
+      r.status = "ended"; // сразу, чтобы лишние нажатия не сработали
+      await this.answer(cq, "🎉 Собрались! Начинаем");
+      await this.edit(r.chatId, r.msgId, `${r.header}\n\n✅ Собрались: ${r.players.map((p) => esc(p.name)).join(", ")}!`);
+      return this.openRound(r.chatId, "🎮 <b>Игра начинается!</b>\n\n" + (await this.introHeader()));
+    }
+    await this.save();
+    await this.answer(cq, `Ты в игре! Ждём ещё ${GATHER_NEED - r.players.length}`);
+    return this.edit(r.chatId, r.msgId, this.gatherText(r), this.gatherKeyboard(r));
+  }
+
+  riddleMask(word, level) {
+    const w = upper(word);
+    const show = new Set([0]);
+    if (level >= 2) show.add(w.length - 1);
+    if (level >= 3) for (let i = 2; i < w.length - 1; i += 2) show.add(i);
+    return [...w].map((ch, i) => (show.has(i) ? ch : "_")).join(" ");
+  }
+
+  async startRiddle(day) {
+    const level = (this.settings || DEFAULT_SETTINGS).level;
+    const word = this.pickWord(level === "easy" ? "medium" : level);
+    await this.save();
+    const rd = { day, word, hint: 1, solved: false };
+    await this.ctx.storage.put("riddle", rd);
+    return this.send(
+      this.meta.chatId,
+      "🧩 <b>Загадка дня!</b>\n\n" +
+        `Слово из <b>${word.length}</b> ${plural(word.length, "буквы", "букв", "букв")}:\n<code>${this.riddleMask(word, 1)}</code>\n\n` +
+        `Первый, кто напишет его в чат, получит <b>+${RIDDLE_POINTS} очков</b> 🏆\n` +
+        `Подсказки — в ${RIDDLE_HOURS.hint2}:00 и ${RIDDLE_HOURS.hint3}:00.`
+    );
+  }
+
+  async riddleHint(n) {
+    const rd = await this.ctx.storage.get("riddle");
+    if (!rd || rd.solved) return;
+    rd.hint = n;
+    await this.ctx.storage.put("riddle", rd);
+    return this.send(
+      this.meta.chatId,
+      `🧩 <b>Подсказка ${n - 1}/2 к загадке дня</b>\n\n<code>${this.riddleMask(rd.word, n)}</code>\n\nЕщё никто не угадал — твой шанс! +${RIDDLE_POINTS} очков`
+    );
+  }
+
+  async revealRiddle() {
+    const rd = await this.ctx.storage.get("riddle");
+    if (!rd || rd.solved) return;
+    await this.ctx.storage.delete("riddle");
+    return this.send(this.meta.chatId, `🧩 Загадку дня никто не разгадал 😔\nЭто было слово <b>${upper(rd.word)}</b>.\n\nЗавтра в ${RIDDLE_HOURS.start}:00 — новая!`);
+  }
+
+  async checkRiddle(msg) {
+    if (!this.alive.on) return;
+    const rd = await this.ctx.storage.get("riddle");
+    if (!rd || rd.solved) return;
+    const tokens = tokenize(msg.text);
+    if (!tokens.some((t) => t === normalize(rd.word) || (rd.word.length >= 5 && matches(t, rd.word)))) return;
+    rd.solved = true;
+    await this.ctx.storage.put("riddle", rd);
+    const name = displayName(msg.from);
+    await this.addStats(msg.from.id, name, { points: RIDDLE_POINTS });
+    await this.tg("setMessageReaction", { chat_id: msg.chat.id, message_id: msg.message_id, reaction: [{ type: "emoji", emoji: "🏆" }] });
+    return this.send(msg.chat.id, `🧩 <b>${esc(name)}</b> разгадал(а) загадку дня — <b>${upper(rd.word)}</b>! +${RIDDLE_POINTS} очков 🎉\n\nЗавтра в ${RIDDLE_HOURS.start}:00 — новая загадка.`);
+  }
+
+  async weeklySummary() {
+    const wk = await this.ctx.storage.get("week");
+    if (!wk || wk.id !== weekId(this.env)) return;
+    const top = Object.values(wk.p).filter((e) => e.points > 0).sort((a, b) => b.points - a.points).slice(0, 5);
+    if (!top.length) return;
+    const medals = ["🥇", "🥈", "🥉", "4.", "5."];
+    await this.ctx.storage.put("week", { id: wk.id + "-done", p: {} });
+    return this.send(
+      this.meta.chatId,
+      "🏆 <b>Итоги недели!</b>\n\n" +
+        top.map((e, i) => `${medals[i]} <b>${esc(e.name)}</b> — ${e.points}`).join("\n") +
+        `\n\n👑 <b>Игрок недели — ${esc(top[0].name)}!</b> Поздравляем!\n\nНовая неделя — новый шанс. Начать игру — /game`
+    );
   }
 
   // ---------- модерация ----------
@@ -1073,6 +1361,8 @@ export class CrocodileGame extends DurableObject {
     }
     this.mod = { on: true };
     await this.ctx.storage.put("mod", this.mod);
+    this.alive = { on: true };
+    await this.ctx.storage.put("alive", this.alive);
     await this.registry("set_official", { snap: await this.snapshot(), invite });
     const problem = await this.botRightsProblem(chatId);
     return this.send(
@@ -1080,7 +1370,8 @@ export class CrocodileGame extends DurableObject {
       "⭐ <b>Это официальная группа Крокодила!</b>\n\n" +
         "• Она закреплена первой в меню бота (/start в личке) и выделена ⭐\n" +
         "• Модерация включена: мат, реклама и ссылки — предупреждение → мут → бан\n" +
-        "• Новички получают приветствие с правилами" +
+        "• Новички получают приветствие с правилами\n" +
+        "• 🌱 Живая группа: загадка дня, вечерняя игра в 20:00, итоги недели по воскресеньям" +
         (problem ? "\n\n⚠️ " + problem : "")
     );
   }
@@ -1226,7 +1517,7 @@ export class CrocodileGame extends DurableObject {
   async cmdStop(msg, anonAdmin) {
     const chatId = msg.chat.id;
     const st = this.round.status;
-    if (st !== "waiting" && st !== "playing" && st !== "setup") {
+    if (st !== "waiting" && st !== "playing" && st !== "setup" && st !== "gather") {
       return this.send(chatId, "Сейчас нет активной игры. Начать — /game");
     }
 
@@ -1237,7 +1528,7 @@ export class CrocodileGame extends DurableObject {
     if (!allowed) return this.send(chatId, "🛑 Остановить игру может ведущий или админ группы.");
 
     const cur = this.round;
-    if (!["waiting", "playing", "setup"].includes(cur.status)) return; // пока проверяли права, всё уже закончилось
+    if (!["waiting", "playing", "setup", "gather"].includes(cur.status)) return; // пока проверяли права, всё уже закончилось
     const word = cur.status === "playing" ? cur.word : null;
     this.round = { status: "idle" };
     await this.save();
@@ -1256,7 +1547,7 @@ export class CrocodileGame extends DurableObject {
   // ---------- таймер ----------
   async alarm() {
     const r = this.round;
-    if (!["waiting", "playing", "setup"].includes(r.status)) return;
+    if (!["waiting", "playing", "setup", "gather"].includes(r.status)) return;
     if (Date.now() < r.deadline - 1000) {
       await this.ctx.storage.setAlarm(r.deadline);
       return;
@@ -1266,6 +1557,19 @@ export class CrocodileGame extends DurableObject {
       this.round = { status: "idle" };
       await this.save();
       if (r.msgId) await this.edit(r.chatId, r.msgId, "⌛ Настройка не завершена. Начать заново — /game");
+      return;
+    }
+
+    if (r.status === "gather") {
+      this.round = { status: "idle" };
+      await this.save();
+      if (r.msgId) {
+        await this.edit(
+          r.chatId,
+          r.msgId,
+          `${r.header}\n\n😔 Не собрались (${r.players.length}/${GATHER_NEED}). Ничего страшного — сыграть можно в любое время: /game`
+        );
+      }
       return;
     }
 
@@ -1313,6 +1617,8 @@ export class ArenaRegistry extends DurableObject {
       else if (path === "catalog_state") out = this.catalogState(await this.report(body.snap));
       else if (path === "set_listed") out = await this.setListed(body.snap, body.listed, body.invite);
       else if (path === "set_official") out = await this.setOfficial(body.snap, body.invite);
+      else if (path === "alive_groups") out = await this.aliveGroups();
+      else if (path === "is_official") out = { official: String((await this.ctx.storage.get("official")) || "") === String(body.chatId) };
     } catch (e) {
       console.log("registry error", e?.stack || String(e));
       out = { ok: false, text: "⚠️ Ошибка, попробуйте позже." };
@@ -1341,6 +1647,7 @@ export class ArenaRegistry extends DurableObject {
     g.title = snap.title || g.title || "";
     g.username = snap.username || "";
     g.level = snap.level || g.level || "medium";
+    g.alive = !!snap.alive;
     g.players = snap.players || 0;
     g.leader = snap.leader || null;
     g.updated = Date.now();
@@ -1376,6 +1683,11 @@ export class ArenaRegistry extends DurableObject {
     if (invite) g.invite = invite;
     await this.ctx.storage.put("g:" + g.chatId, g);
     return this.catalogState(g);
+  }
+
+  async aliveGroups() {
+    const all = [...(await this.ctx.storage.list({ prefix: "g:" })).values()];
+    return { chats: all.filter((g) => g.alive && !g.removed).map((g) => g.chatId) };
   }
 
   async setOfficial(snap, invite) {
@@ -1771,6 +2083,13 @@ function plural(n, one, few, many) {
   if (b === 1) return one;
   if (b >= 2 && b <= 4) return few;
   return many;
+}
+
+// Номер недели (неделя начинается в понедельник, по времени ALIVE_TZ)
+function weekId(env) {
+  const local = Date.now() + tzOffset(env) * 3600 * 1000;
+  const days = Math.floor(local / 86400000);
+  return Math.floor((days + 3) / 7); // 1 янв 1970 — четверг → сдвиг на понедельник
 }
 
 // ---------- фильтр мата и ссылок ----------
