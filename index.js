@@ -41,6 +41,7 @@ const COMMANDS = [
   { command: "challenge", description: "⚔️ Вызов на Супер-игру (для лидера группы)" },
   { command: "settings", description: "⚙️ Сложность и время (админы)" },
   { command: "catalog", description: "📋 Показать группу в каталоге игр (админы)" },
+  { command: "moderation", description: "🛡 Фильтр мата, рекламы и ссылок (админы)" },
   { command: "stop", description: "🛑 Остановить игру" },
   { command: "rules", description: "📖 Правила и очки" },
 ];
@@ -50,6 +51,19 @@ const PRIVATE_COMMANDS = [
   { command: "myid", description: "🆔 Мой Telegram ID" },
 ];
 const CATALOG_PAGE = 8; // групп на одной странице каталога
+
+// ================== МОДЕРАЦИЯ ==================
+const MAX_WARNS = 3;                          // 1 — предупреждение, 2 — мут, 3 — бан
+const MUTE_SEC = 24 * 60 * 60;                // мут на сутки
+const WARN_RESET_MS = 30 * 24 * 60 * 60 * 1000; // предупреждения сгорают через 30 дней
+const NEWCOMER_MS = 24 * 60 * 60 * 1000;      // новичок со ссылкой в первые сутки — бан сразу
+const GROUP_RULES =
+  "📜 <b>Правила группы:</b>\n" +
+  "🚫 Мат и оскорбления\n" +
+  "🚫 Реклама и самопиар\n" +
+  "🚫 Ссылки и пересылки из каналов\n\n" +
+  "⚠️ Нарушение: 1-е — предупреждение, 2-е — мут на сутки, 3-е — бан.\n" +
+  "⛔ Новички, которые сразу кидают ссылки, банятся без предупреждения.";
 
 const HOW_TO_PLAY =
   "<b>Как играть:</b>\n" +
@@ -174,10 +188,18 @@ async function sendCatalog(env, chatId, page, editMsgId) {
 
   let html = "🐊 <b>Крокодил — игра в группах Telegram</b>\n\n";
   const rows = [];
-  if (!cat.total) {
+  if (cat.official && cat.page === 0) {
+    const o = cat.official;
+    html +=
+      "⭐ <b>ОФИЦИАЛЬНАЯ ГРУППА</b> ⭐\n" +
+      `<b>${esc(o.title || "Крокодил")}</b>${o.members ? " · 👥 " + o.members : ""}\n` +
+      "Здесь всегда есть с кем поиграть, порядок и модерация 🛡\n\n";
+    rows.push([{ text: `⭐ ${String(o.title || "Официальная группа").slice(0, 36)} ⭐`, url: o.link }]);
+  }
+  if (!cat.total && !cat.official) {
     html += "Пока нет открытых групп для игры 😔\n\nДобавь бота в свою группу — и играйте с друзьями!";
-  } else {
-    html += `🎮 Выбери группу и заходи играть с людьми (всего ${cat.total}):\n\n`;
+  } else if (cat.total) {
+    html += cat.total ? `🎮 Другие группы для игры (всего ${cat.total}):\n\n` : "";
     cat.items.forEach((g, i) => {
       const n = cat.page * CATALOG_PAGE + i + 1;
       const lvl = LEVELS[g.level]?.name || LEVELS.medium.name;
@@ -187,6 +209,8 @@ async function sendCatalog(env, chatId, page, editMsgId) {
       rows.push([{ text: `${n}. ${String(g.title || "Группа").slice(0, 40)}`, url: g.link }]);
     });
     html += "\nНажми на группу, чтобы перейти в неё и вступить.";
+  }
+  if (cat.total) {
     if (cat.pages > 1) {
       const nav = [];
       if (cat.page > 0) nav.push({ text: "◀️", callback_data: "cat:" + (cat.page - 1) });
@@ -244,6 +268,9 @@ export class CrocodileGame extends DurableObject {
     this.meta = {};          // { chatId, title }
     this.isArena = false;    // эта группа — Арена Супер-игры
     this.allowed = new Set(); // ID участников Супер-игры (только для Арены)
+    this.mod = { on: false };  // модерация: мат, реклама, ссылки
+    this.admins = null;        // кэш админов группы
+    this.adminsAt = 0;
     ctx.blockConcurrencyWhile(async () => {
       this.round = (await ctx.storage.get("round")) || { status: "idle" };
       this.recent = (await ctx.storage.get("recent")) || [];
@@ -251,6 +278,7 @@ export class CrocodileGame extends DurableObject {
       this.meta = (await ctx.storage.get("meta")) || {};
       this.isArena = !!(await ctx.storage.get("arena"));
       this.allowed = new Set((await ctx.storage.get("allowed")) || []);
+      this.mod = (await ctx.storage.get("mod")) || { on: false };
     });
   }
 
@@ -456,12 +484,13 @@ export class CrocodileGame extends DurableObject {
     return this.allowed.has(uid);
   }
 
-  async restrict(chatId, userId, allow) {
+  async restrict(chatId, userId, allow, untilSec) {
     const v = !!allow;
     return this.tg("restrictChatMember", {
       chat_id: chatId,
       user_id: userId,
       use_independent_chat_permissions: true,
+      ...(untilSec ? { until_date: Math.floor(Date.now() / 1000) + untilSec } : {}),
       permissions: {
         can_send_messages: v, can_send_audios: v, can_send_documents: v, can_send_photos: v,
         can_send_videos: v, can_send_video_notes: v, can_send_voice_notes: v, can_send_polls: v,
@@ -506,7 +535,9 @@ export class CrocodileGame extends DurableObject {
           return this.send(chatId, "🐊 <b>Я снова с вами!</b>\n\n" + (await this.introHeader()) + "\n\nНачать игру — /game");
         }
         if (this.round.status === "idle") return this.startSetup(chatId, msg.from?.id || null, true);
+        return;
       }
+      if (this.mod.on) await this.welcome(chatId, msg.new_chat_members.filter((u) => !u.is_bot));
       return;
     }
 
@@ -521,6 +552,12 @@ export class CrocodileGame extends DurableObject {
         await this.restrict(chatId, uid, false);
         return;
       }
+    }
+
+    // Модерация: мат, реклама, ссылки
+    if (this.mod.on && !anonAdmin && msg.from && !msg.from.is_bot) {
+      const why = await this.findViolation(msg);
+      if (why) return this.punish(msg, why);
     }
 
     if (!msg.text) return;
@@ -556,9 +593,13 @@ export class CrocodileGame extends DurableObject {
         return this.cmdStop(msg, anonAdmin);
       case "/rules":
       case "/help":
-        return this.send(msg.chat.id, rulesText(this.cfg(), this.env));
+        return this.send(msg.chat.id, rulesText(this.cfg(), this.env) + (this.mod.on ? "\n\n" + GROUP_RULES : ""));
       case "/catalog":
         return this.cmdCatalog(msg, anonAdmin);
+      case "/moderation":
+        return this.cmdModeration(msg, anonAdmin);
+      case "/official":
+        return this.cmdOfficial(msg);
       case "/arena_here":
         return this.cmdArenaHere(msg);
       case "/arena_finish":
@@ -805,6 +846,7 @@ export class CrocodileGame extends DurableObject {
     const data = String(cq.data || "");
     if (data === "chal" || data.startsWith("acc:")) return this.onArenaCallback(cq, data);
     if (data.startsWith("catl:")) return this.onCatalogCallback(cq, data);
+    if (data.startsWith("mod:")) return this.onModerationCallback(cq, data);
 
     const r = this.round;
     const msgId = cq.message?.message_id;
@@ -905,6 +947,142 @@ export class CrocodileGame extends DurableObject {
     if (!msg.from || msg.from.is_bot) return;
     const res = await this.registry("challenge", { snap: await this.snapshot(), userId: msg.from.id });
     return this.send(chatId, res.text);
+  }
+
+  // ---------- модерация ----------
+  async adminIds(chatId) {
+    if (this.admins && Date.now() - this.adminsAt < 10 * 60 * 1000) return this.admins;
+    const res = await this.tg("getChatAdministrators", { chat_id: chatId });
+    this.admins = new Set(res.ok ? res.result.map((m) => m.user.id) : []);
+    this.adminsAt = Date.now();
+    return this.admins;
+  }
+
+  async findViolation(msg) {
+    const uid = msg.from.id;
+    if (this.isOwner(uid)) return null;
+    if ((await this.adminIds(msg.chat.id)).has(uid)) return null;
+    const txt = (msg.text || "") + " " + (msg.caption || "");
+    const entities = [...(msg.entities || []), ...(msg.caption_entities || [])];
+    const fromChannel = msg.forward_origin?.type === "channel" || msg.forward_from_chat?.type === "channel";
+    if (fromChannel) return "ad";
+    if (entities.some((e) => e.type === "url" || e.type === "text_link") || hasLink(txt)) return "link";
+    if (hasProfanity(txt)) return "mat";
+    return null;
+  }
+
+  async punish(msg, why) {
+    const chatId = msg.chat.id;
+    const uid = msg.from.id;
+    const name = esc(displayName(msg.from));
+    const reasons = { mat: "мат", link: "ссылки запрещены", ad: "реклама / пересылка из канала" };
+    await this.tg("deleteMessage", { chat_id: chatId, message_id: msg.message_id });
+
+    const joined = await this.ctx.storage.get("j:" + uid);
+    const newcomer = (why === "link" || why === "ad") && joined && Date.now() - joined < NEWCOMER_MS;
+
+    const key = "w:" + uid;
+    let w = (await this.ctx.storage.get(key)) || { count: 0, at: 0 };
+    if (Date.now() - w.at > WARN_RESET_MS) w = { count: 0, at: 0 };
+    w.count++;
+    w.at = Date.now();
+
+    if (newcomer || w.count >= MAX_WARNS) {
+      await this.ctx.storage.delete(key);
+      await this.tg("banChatMember", { chat_id: chatId, user_id: uid, revoke_messages: !!newcomer });
+      return this.send(chatId, `⛔ <b>${name}</b> забанен(а). Причина: ${reasons[why]}${newcomer ? " (спам от нового участника)" : ""}.`);
+    }
+    await this.ctx.storage.put(key, w);
+    if (w.count === MAX_WARNS - 1) {
+      await this.restrict(chatId, uid, false, MUTE_SEC);
+      return this.send(
+        chatId,
+        `🔇 <b>${name}</b>, мут на сутки. Причина: ${reasons[why]}.\nПредупреждение ${w.count}/${MAX_WARNS} — следующее нарушение = бан.`
+      );
+    }
+    return this.send(chatId, `⚠️ <b>${name}</b>, предупреждение ${w.count}/${MAX_WARNS}. Причина: ${reasons[why]}.\nПравила группы — /rules`);
+  }
+
+  async welcome(chatId, users) {
+    if (!users.length) return;
+    for (const u of users) await this.ctx.storage.put("j:" + u.id, Date.now());
+    const names = users.map((u) => `<b>${esc(displayName(u))}</b>`).join(", ");
+    const prev = await this.ctx.storage.get("lastWelcome");
+    if (prev) await this.tg("deleteMessage", { chat_id: chatId, message_id: prev }); // не засоряем чат
+    const res = await this.send(
+      chatId,
+      `👋 Добро пожаловать, ${names}!\n\nЭто группа для игры в «Крокодил» 🐊\n` +
+        "Один объясняет слово, остальные угадывают — кто быстрее, тот получает очки.\n\n" +
+        GROUP_RULES +
+        "\n\n🎮 Начать игру — /game · Как играть — /rules"
+    );
+    if (res.ok) await this.ctx.storage.put("lastWelcome", res.result.message_id);
+  }
+
+  async botRightsProblem(chatId) {
+    const me = await this.getMe();
+    const res = await this.tg("getChatMember", { chat_id: chatId, user_id: me.id });
+    const m = res.result || {};
+    if (m.status !== "administrator") return "Бот не админ группы.";
+    const miss = [];
+    if (!m.can_delete_messages) miss.push("Удаление сообщений");
+    if (!m.can_restrict_members) miss.push("Блокировка пользователей");
+    return miss.length ? "Боту не хватает прав: " + miss.join(", ") + "." : null;
+  }
+
+  modText(problem) {
+    return (
+      "🛡 <b>Модерация группы</b>\n\n" +
+      "Сейчас: " + (this.mod.on ? "✅ <b>включена</b>" : "🚫 <b>выключена</b>") +
+      "\n\nКогда включена, бот:\n• удаляет мат, ссылки и пересылки из каналов\n• наказывает: предупреждение → мут на сутки → бан\n" +
+      "• приветствует новичков и знакомит с правилами\n• админов группы не трогает" +
+      (problem ? "\n\n⚠️ " + problem + " Без этого модерация не сработает." : "")
+    );
+  }
+
+  async cmdModeration(msg, anonAdmin) {
+    const chatId = msg.chat.id;
+    if (!anonAdmin && !this.isOwner(msg.from?.id) && !(await this.isAdmin(chatId, msg.from?.id))) {
+      return this.send(chatId, "🛡 Включать модерацию могут только админы группы.");
+    }
+    const problem = await this.botRightsProblem(chatId);
+    return this.send(chatId, this.modText(problem), {
+      reply_markup: kb([[this.mod.on ? ["🚫 Выключить модерацию", "mod:off"] : ["✅ Включить модерацию", "mod:on"]]]),
+    });
+  }
+
+  async onModerationCallback(cq, data) {
+    const chatId = cq.message.chat.id;
+    if (!this.isOwner(cq.from.id) && !(await this.isAdmin(chatId, cq.from.id))) return this.answer(cq, "Только для админов группы", true);
+    this.mod = { on: data === "mod:on" };
+    await this.ctx.storage.put("mod", this.mod);
+    const problem = this.mod.on ? await this.botRightsProblem(chatId) : null;
+    await this.answer(cq, this.mod.on ? "🛡 Модерация включена" : "Модерация выключена");
+    return this.edit(chatId, cq.message.message_id, this.modText(problem), kb([[this.mod.on ? ["🚫 Выключить модерацию", "mod:off"] : ["✅ Включить модерацию", "mod:on"]]]));
+  }
+
+  // Владелец: сделать группу официальной (закреплена ⭐ в меню бота, модерация включена)
+  async cmdOfficial(msg) {
+    const chatId = msg.chat.id;
+    if (!this.isOwner(msg.from?.id) || this.isArena) return;
+    let invite = null;
+    if (!this.meta.username) {
+      const res = await this.tg("createChatInviteLink", { chat_id: chatId, name: "Официальная группа" });
+      if (!res.ok) return this.send(chatId, "⚠️ Не получилось создать ссылку-приглашение. Дай боту право админа «Пригласительные ссылки» и повтори /official.");
+      invite = res.result.invite_link;
+    }
+    this.mod = { on: true };
+    await this.ctx.storage.put("mod", this.mod);
+    await this.registry("set_official", { snap: await this.snapshot(), invite });
+    const problem = await this.botRightsProblem(chatId);
+    return this.send(
+      chatId,
+      "⭐ <b>Это официальная группа Крокодила!</b>\n\n" +
+        "• Она закреплена первой в меню бота (/start в личке) и выделена ⭐\n" +
+        "• Модерация включена: мат, реклама и ссылки — предупреждение → мут → бан\n" +
+        "• Новички получают приветствие с правилами" +
+        (problem ? "\n\n⚠️ " + problem : "")
+    );
   }
 
   // ---------- каталог групп ----------
@@ -1134,6 +1312,7 @@ export class ArenaRegistry extends DurableObject {
       else if (path === "catalog") out = await this.catalog(Number(body.page) || 0);
       else if (path === "catalog_state") out = this.catalogState(await this.report(body.snap));
       else if (path === "set_listed") out = await this.setListed(body.snap, body.listed, body.invite);
+      else if (path === "set_official") out = await this.setOfficial(body.snap, body.invite);
     } catch (e) {
       console.log("registry error", e?.stack || String(e));
       out = { ok: false, text: "⚠️ Ошибка, попробуйте позже." };
@@ -1199,6 +1378,16 @@ export class ArenaRegistry extends DurableObject {
     return this.catalogState(g);
   }
 
+  async setOfficial(snap, invite) {
+    const g = await this.report(snap);
+    if (!g) return { ok: false };
+    if (invite) g.invite = invite;
+    g.listed = true;
+    await this.ctx.storage.put("g:" + g.chatId, g);
+    await this.ctx.storage.put("official", g.chatId);
+    return { ok: true };
+  }
+
   async removeGroup(chatId) {
     const g = await this.ctx.storage.get("g:" + chatId);
     if (g) {
@@ -1209,8 +1398,12 @@ export class ArenaRegistry extends DurableObject {
   }
 
   async catalog(page) {
+    const officialId = await this.ctx.storage.get("official");
+    const og = officialId ? await this.ctx.storage.get("g:" + officialId) : null;
+    const official =
+      og && !og.removed && this.groupLink(og) ? { title: og.title, link: this.groupLink(og), members: og.members || 0 } : null;
     const all = [...(await this.ctx.storage.list({ prefix: "g:" })).values()]
-      .filter((g) => this.isListed(g))
+      .filter((g) => this.isListed(g) && String(g.chatId) !== String(officialId))
       .sort((a, b) => (b.updated || 0) - (a.updated || 0)); // сначала активные
     const pages = Math.max(1, Math.ceil(all.length / CATALOG_PAGE));
     page = Math.min(Math.max(0, page), pages - 1);
@@ -1222,7 +1415,7 @@ export class ArenaRegistry extends DurableObject {
       players: g.players || 0,
       titles: g.titles || 0,
     }));
-    return { items, page, pages, total: all.length };
+    return { items, page, pages, total: all.length, official };
   }
 
   eligible(g) {
@@ -1578,6 +1771,44 @@ function plural(n, one, few, many) {
   if (b === 1) return one;
   if (b >= 2 && b <= 4) return few;
   return many;
+}
+
+// ---------- фильтр мата и ссылок ----------
+const LOOKALIKE = { a: "а", e: "е", o: "о", p: "р", c: "с", x: "х", y: "у", k: "к", m: "м", t: "т", h: "н", "3": "з", "0": "о", "6": "б" };
+const BAD_WORDS = [
+  /^(на|за|вы|у|от|по|при|раз|рас|до|об|пере|недо|долбо|съ|подъ|объ|разъ|въ|изъ)?еб(?!ол)/, // ебать, заебал, выебон…
+  /^(на|по|ни|от|за|до|о)?ху[йеияю]/,                                                       // хуй, нахуй, охуеть…
+  /пизд/,
+  /^(вы|раз|по|за|на)?бля(д|т)|^бля$/,
+  /^сук(а|и|у|ой|ам|ами|ах)?$/,
+  /^суч(ка|ки|ку|кой|ара|ий|ье)/,
+  /^муд(ак|ил|озвон|ач)/,
+  /^(пидор|пидар|пидр)/,
+  /^залуп/,
+  /^г[ао]ндон/,
+  /^шлюх/,
+  /^(за|по|на|от|пере)?дроч/,
+  /^манд(а|у|ой|ы)$/,
+  /^мраз(ь|и|ота)/,
+  /^ублюд/,
+];
+
+function profanityTokens(t) {
+  let s = String(t).toLowerCase().replace(/ё/g, "е");
+  s = s.replace(/[aeopcxykmth306]/g, (ch) => LOOKALIKE[ch] || ch);         // латиница-двойники → кириллица
+  s = s.replace(/([а-я])[*.\-_@#$%!]+(?=[а-я])/g, "$1");                   // х*й, х.у.й → хуй
+  s = s.replace(/([а-я])\1+/g, "$1");                                       // хуууй → хуй
+  return s.split(/[^а-я]+/).filter(Boolean);
+}
+
+function hasProfanity(t) {
+  const variants = [String(t)];
+  if (String(t).includes("*")) for (const ch of "уиеаоб") variants.push(String(t).replace(/\*/g, ch)); // х*й, п*здец, е*ать
+  return variants.some((v) => profanityTokens(v).some((w) => BAD_WORDS.some((re) => re.test(w))));
+}
+
+function hasLink(t) {
+  return /(https?:\/\/|www\.|t\.me\/|telegram\.(me|dog)\/|\b[a-z0-9-]+\.(ru|com|net|org|io|me|xyz|top|site|online|shop|info|biz|club|link|ly)\b)/i.test(String(t));
 }
 
 // ---------- проверка угадывания ----------
