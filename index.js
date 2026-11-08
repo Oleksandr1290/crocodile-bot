@@ -40,9 +40,16 @@ const COMMANDS = [
   { command: "me", description: "📊 Моя статистика" },
   { command: "challenge", description: "⚔️ Вызов на Супер-игру (для лидера группы)" },
   { command: "settings", description: "⚙️ Сложность и время (админы)" },
+  { command: "catalog", description: "📋 Показать группу в каталоге игр (админы)" },
   { command: "stop", description: "🛑 Остановить игру" },
   { command: "rules", description: "📖 Правила и очки" },
 ];
+
+const PRIVATE_COMMANDS = [
+  { command: "start", description: "🎮 Меню: найти группу для игры" },
+  { command: "myid", description: "🆔 Мой Telegram ID" },
+];
+const CATALOG_PAGE = 8; // групп на одной странице каталога
 
 const HOW_TO_PLAY =
   "<b>Как играть:</b>\n" +
@@ -88,10 +95,11 @@ export default {
       const webhook = await tg(env, "setWebhook", {
         url: `${url.origin}/webhook`,
         secret_token: env.WEBHOOK_SECRET,
-        allowed_updates: ["message", "callback_query", "chat_join_request"],
+        allowed_updates: ["message", "callback_query", "chat_join_request", "my_chat_member"],
         drop_pending_updates: true,
       });
       const commands = await tg(env, "setMyCommands", { commands: COMMANDS });
+      await tg(env, "setMyCommands", { commands: PRIVATE_COMMANDS, scope: { type: "all_private_chats" } });
 
       if (me.ok && webhook.ok && commands.ok) {
         return text(
@@ -114,13 +122,18 @@ export default {
       }
 
       const chat =
-        update.message?.chat || update.callback_query?.message?.chat || update.chat_join_request?.chat;
+        update.message?.chat ||
+        update.callback_query?.message?.chat ||
+        update.chat_join_request?.chat ||
+        update.my_chat_member?.chat;
       try {
         if (!chat) {
           if (update.callback_query) await tg(env, "answerCallbackQuery", { callback_query_id: update.callback_query.id });
         } else if (chat.type === "group" || chat.type === "supergroup") {
           const stub = env.GAME.get(env.GAME.idFromName(String(chat.id)));
           await stub.fetch("https://game/update", { method: "POST", body: JSON.stringify(update) });
+        } else if (chat.type === "private" && update.callback_query) {
+          await handlePrivateCallback(env, update.callback_query);
         } else if (chat.type === "private" && update.message?.text) {
           await handlePrivate(env, update.message);
         }
@@ -150,20 +163,64 @@ async function handlePrivate(env, msg) {
     return tg(env, "sendMessage", { chat_id: msg.chat.id, parse_mode: "HTML", text: res.text });
   }
 
+  return sendCatalog(env, msg.chat.id, 0, null);
+}
+
+// ---------- Меню в личке: каталог групп ----------
+async function sendCatalog(env, chatId, page, editMsgId) {
   const me = await tg(env, "getMe", {});
   const username = me.result?.username;
-  await tg(env, "sendMessage", {
-    chat_id: msg.chat.id,
-    parse_mode: "HTML",
-    text:
-      "🐊 <b>Привет! Я бот для игры «Крокодил».</b>\n\n" +
-      "Добавь меня в группу, сделай админом и напиши там /game.\n\n" +
-      HOW_TO_PLAY +
-      "\n\n🏟 Лучшие игроки групп встречаются в Супер-игре на Арене — подробнее в /rules внутри группы.",
-    reply_markup: username
-      ? { inline_keyboard: [[{ text: "➕ Добавить в группу", url: `https://t.me/${username}?startgroup=true` }]] }
-      : undefined,
-  });
+  const cat = await registry(env, "catalog", { page });
+
+  let html = "🐊 <b>Крокодил — игра в группах Telegram</b>\n\n";
+  const rows = [];
+  if (!cat.total) {
+    html += "Пока нет открытых групп для игры 😔\n\nДобавь бота в свою группу — и играйте с друзьями!";
+  } else {
+    html += `🎮 Выбери группу и заходи играть с людьми (всего ${cat.total}):\n\n`;
+    cat.items.forEach((g, i) => {
+      const n = cat.page * CATALOG_PAGE + i + 1;
+      const lvl = LEVELS[g.level]?.name || LEVELS.medium.name;
+      html +=
+        `${n}. <b>${esc(g.title || "Группа")}</b>\n` +
+        `     ${g.members ? "👥 " + g.members + " · " : ""}${lvl}${g.players ? " · 🎮 " + g.players + " игроков" : ""}${g.titles ? " · 👑 " + g.titles : ""}\n`;
+      rows.push([{ text: `${n}. ${String(g.title || "Группа").slice(0, 40)}`, url: g.link }]);
+    });
+    html += "\nНажми на группу, чтобы перейти в неё и вступить.";
+    if (cat.pages > 1) {
+      const nav = [];
+      if (cat.page > 0) nav.push({ text: "◀️", callback_data: "cat:" + (cat.page - 1) });
+      nav.push({ text: `${cat.page + 1} / ${cat.pages}`, callback_data: "noop" });
+      if (cat.page < cat.pages - 1) nav.push({ text: "▶️", callback_data: "cat:" + (cat.page + 1) });
+      rows.push(nav);
+    }
+  }
+  if (username) rows.push([{ text: "➕ Добавить бота в свою группу", url: `https://t.me/${username}?startgroup=true` }]);
+  rows.push([{ text: "📖 Как играть", callback_data: "howto" }, { text: "🔄 Обновить", callback_data: "cat:" + (cat.page || 0) }]);
+
+  const body = { chat_id: chatId, text: html, parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: { inline_keyboard: rows } };
+  if (editMsgId) return tg(env, "editMessageText", { ...body, message_id: editMsgId });
+  return tg(env, "sendMessage", body);
+}
+
+async function handlePrivateCallback(env, cq) {
+  const data = String(cq.data || "");
+  if (data.startsWith("cat:")) {
+    await tg(env, "answerCallbackQuery", { callback_query_id: cq.id });
+    return sendCatalog(env, cq.message.chat.id, Math.max(0, Number(data.slice(4)) || 0), cq.message.message_id);
+  }
+  if (data === "howto") {
+    await tg(env, "answerCallbackQuery", { callback_query_id: cq.id });
+    return tg(env, "sendMessage", {
+      chat_id: cq.message.chat.id,
+      parse_mode: "HTML",
+      text:
+        HOW_TO_PLAY +
+        "\n\n🏟 <b>Супер-игра:</b> лидеры групп с 1000+ очков на 🔴 Сложном или 💀 Ультимейте " +
+        "бросают вызов друг другу и сражаются на Арене за звание чемпиона.\n\nВернуться к списку групп — /start",
+    });
+  }
+  return tg(env, "answerCallbackQuery", { callback_query_id: cq.id });
 }
 
 function isOwnerId(env, userId) {
@@ -202,8 +259,11 @@ export class CrocodileGame extends DurableObject {
     const body = await request.json();
     try {
       if (path === "/allow") return Response.json(await this.allowPlayers(body.ids || []));
-      await this.rememberChat(body.message?.chat || body.callback_query?.message?.chat || body.chat_join_request?.chat);
-      if (body.callback_query) await this.onCallback(body.callback_query);
+      await this.rememberChat(
+        body.message?.chat || body.callback_query?.message?.chat || body.chat_join_request?.chat || body.my_chat_member?.chat
+      );
+      if (body.my_chat_member) await this.onMyChatMember(body.my_chat_member);
+      else if (body.callback_query) await this.onCallback(body.callback_query);
       else if (body.message) await this.onMessage(body.message);
       else if (body.chat_join_request) await this.onJoinRequest(body.chat_join_request);
     } catch (e) {
@@ -261,9 +321,21 @@ export class CrocodileGame extends DurableObject {
 
   async rememberChat(chat) {
     if (!chat || (chat.type !== "group" && chat.type !== "supergroup")) return;
-    if (this.meta.chatId !== chat.id || this.meta.title !== chat.title) {
-      this.meta = { chatId: chat.id, title: chat.title || "" };
+    const username = chat.username || "";
+    if (this.meta.chatId !== chat.id || this.meta.title !== (chat.title || "") || this.meta.username !== username) {
+      this.meta = { chatId: chat.id, title: chat.title || "", username };
       await this.ctx.storage.put("meta", this.meta);
+      await this.report(); // название/ссылка изменились — обновить каталог
+    }
+  }
+
+  // Бота добавили/удалили из группы
+  async onMyChatMember(u) {
+    const st = u.new_chat_member?.status;
+    if (st === "left" || st === "kicked") {
+      await this.registry("remove", { chatId: u.chat.id });
+    } else {
+      await this.report();
     }
   }
 
@@ -337,6 +409,8 @@ export class CrocodileGame extends DurableObject {
     return {
       chatId: this.meta.chatId,
       title: this.meta.title,
+      username: this.meta.username || "",
+      level: (this.settings || DEFAULT_SETTINGS).level,
       players: players.length,
       leader: top ? { id: top.id, name: top.name, points: top.points, hardPoints: top.hardPoints || 0 } : null,
     };
@@ -436,6 +510,9 @@ export class CrocodileGame extends DurableObject {
       return;
     }
 
+    // Группа стала супергруппой — у неё новый ID, старую запись убираем из каталога
+    if (msg.migrate_to_chat_id) return this.registry("remove", { chatId });
+
     // Арена: писать могут только участники Супер-игры и владелец
     if (this.isArena && !anonAdmin && msg.from && !msg.from.is_bot) {
       const uid = msg.from.id;
@@ -480,6 +557,8 @@ export class CrocodileGame extends DurableObject {
       case "/rules":
       case "/help":
         return this.send(msg.chat.id, rulesText(this.cfg(), this.env));
+      case "/catalog":
+        return this.cmdCatalog(msg, anonAdmin);
       case "/arena_here":
         return this.cmdArenaHere(msg);
       case "/arena_finish":
@@ -590,7 +669,14 @@ export class CrocodileGame extends DurableObject {
     await this.ctx.storage.put("settings", s);
     await this.save();
     await this.answer(cq, "Настройки сохранены ✅");
-    await this.edit(r.chatId, r.msgId, "✅ <b>Игра настроена!</b>\n" + settingsLine(s) + "\n\nИзменить настройки — /settings (админы)");
+    await this.edit(
+      r.chatId,
+      r.msgId,
+      "✅ <b>Игра настроена!</b>\n" +
+        settingsLine(s) +
+        "\n\nИзменить настройки — /settings (админы)\n📋 Чтобы новые игроки находили вашу группу через меню бота — /catalog"
+    );
+    await this.report();
     return this.openRound(r.chatId, await this.introHeader());
   }
 
@@ -718,6 +804,7 @@ export class CrocodileGame extends DurableObject {
   async onCallback(cq) {
     const data = String(cq.data || "");
     if (data === "chal" || data.startsWith("acc:")) return this.onArenaCallback(cq, data);
+    if (data.startsWith("catl:")) return this.onCatalogCallback(cq, data);
 
     const r = this.round;
     const msgId = cq.message?.message_id;
@@ -818,6 +905,49 @@ export class CrocodileGame extends DurableObject {
     if (!msg.from || msg.from.is_bot) return;
     const res = await this.registry("challenge", { snap: await this.snapshot(), userId: msg.from.id });
     return this.send(chatId, res.text);
+  }
+
+  // ---------- каталог групп ----------
+  catalogText(st) {
+    return (
+      "📋 <b>Каталог групп</b>\n\n" +
+      "В меню бота (/start в личке) игроки видят список групп и могут зайти в них поиграть.\n\n" +
+      "Ваша группа сейчас: " +
+      (st.listed ? "✅ <b>видна в каталоге</b>" : "🚫 <b>скрыта</b>") +
+      (st.public
+        ? "\n\nГруппа публичная, поэтому по умолчанию видна."
+        : "\n\nГруппа закрытая. Чтобы показать её, боту нужно право админа «Пригласительные ссылки» — он создаст ссылку для вступления.")
+    );
+  }
+
+  async cmdCatalog(msg, anonAdmin) {
+    const chatId = msg.chat.id;
+    if (this.isArena) return;
+    if (!anonAdmin && !(await this.isAdmin(chatId, msg.from?.id))) {
+      return this.send(chatId, "📋 Управлять показом группы в каталоге могут только админы.");
+    }
+    const st = await this.registry("catalog_state", { snap: await this.snapshot() });
+    return this.send(chatId, this.catalogText(st), {
+      reply_markup: kb([[st.listed ? ["🚫 Скрыть из каталога", "catl:off"] : ["✅ Показать в каталоге", "catl:on"]]]),
+    });
+  }
+
+  async onCatalogCallback(cq, data) {
+    const chatId = cq.message.chat.id;
+    if (this.isArena) return this.answer(cq);
+    if (!(await this.isAdmin(chatId, cq.from.id))) return this.answer(cq, "Только для админов группы", true);
+    const on = data === "catl:on";
+    let invite = null;
+    if (on && !this.meta.username) {
+      const res = await this.tg("createChatInviteLink", { chat_id: chatId, name: "Каталог Крокодила" });
+      if (!res.ok) {
+        return this.answer(cq, "Не получилось создать ссылку. Сделай бота админом с правом «Пригласительные ссылки» и попробуй снова.", true);
+      }
+      invite = res.result.invite_link;
+    }
+    const st = await this.registry("set_listed", { snap: await this.snapshot(), listed: on, invite });
+    await this.answer(cq, on ? "✅ Группа видна в каталоге" : "🚫 Группа скрыта");
+    return this.edit(chatId, cq.message.message_id, this.catalogText(st), kb([[st.listed ? ["🚫 Скрыть из каталога", "catl:off"] : ["✅ Показать в каталоге", "catl:on"]]]));
   }
 
   // ---------- команды владельца: Арена ----------
@@ -1000,6 +1130,10 @@ export class ArenaRegistry extends DurableObject {
       else if (path === "set_arena") out = await this.setArena(body.chatId, body.title);
       else if (path === "finish") out = await this.finish(body.results || []);
       else if (path === "status") out = await this.status();
+      else if (path === "remove") out = await this.removeGroup(body.chatId);
+      else if (path === "catalog") out = await this.catalog(Number(body.page) || 0);
+      else if (path === "catalog_state") out = this.catalogState(await this.report(body.snap));
+      else if (path === "set_listed") out = await this.setListed(body.snap, body.listed, body.invite);
     } catch (e) {
       console.log("registry error", e?.stack || String(e));
       out = { ok: false, text: "⚠️ Ошибка, попробуйте позже." };
@@ -1026,15 +1160,73 @@ export class ArenaRegistry extends DurableObject {
       g = { chatId: snap.chatId, no: seq, titles: 0 };
     }
     g.title = snap.title || g.title || "";
+    g.username = snap.username || "";
+    g.level = snap.level || g.level || "medium";
     g.players = snap.players || 0;
     g.leader = snap.leader || null;
     g.updated = Date.now();
+    g.removed = false;
+    if (!g.membersAt || Date.now() - g.membersAt > 24 * 60 * 60 * 1000) {
+      const res = await this.tg("getChatMemberCount", { chat_id: snap.chatId });
+      if (res.ok) g.members = res.result;
+      g.membersAt = Date.now();
+    }
     await this.ctx.storage.put(key, g);
     return g;
   }
 
+  // ---------- каталог групп ----------
+  groupLink(g) {
+    return g.username ? `https://t.me/${g.username}` : g.invite || null;
+  }
+
+  isListed(g) {
+    if (!g || g.removed || !this.groupLink(g)) return false;
+    if (g.listed === true) return true;
+    return g.listed !== false && !!g.username; // публичные — видны по умолчанию
+  }
+
+  catalogState(g) {
+    return { listed: this.isListed(g), public: !!g?.username };
+  }
+
+  async setListed(snap, listed, invite) {
+    const g = await this.report(snap);
+    if (!g) return { listed: false, public: false };
+    g.listed = !!listed;
+    if (invite) g.invite = invite;
+    await this.ctx.storage.put("g:" + g.chatId, g);
+    return this.catalogState(g);
+  }
+
+  async removeGroup(chatId) {
+    const g = await this.ctx.storage.get("g:" + chatId);
+    if (g) {
+      g.removed = true;
+      await this.ctx.storage.put("g:" + chatId, g);
+    }
+    return { ok: true };
+  }
+
+  async catalog(page) {
+    const all = [...(await this.ctx.storage.list({ prefix: "g:" })).values()]
+      .filter((g) => this.isListed(g))
+      .sort((a, b) => (b.updated || 0) - (a.updated || 0)); // сначала активные
+    const pages = Math.max(1, Math.ceil(all.length / CATALOG_PAGE));
+    page = Math.min(Math.max(0, page), pages - 1);
+    const items = all.slice(page * CATALOG_PAGE, (page + 1) * CATALOG_PAGE).map((g) => ({
+      title: g.title,
+      link: this.groupLink(g),
+      members: g.members || 0,
+      level: g.level,
+      players: g.players || 0,
+      titles: g.titles || 0,
+    }));
+    return { items, page, pages, total: all.length };
+  }
+
   eligible(g) {
-    return !!(g && g.leader && g.leader.hardPoints >= minPoints(this.env) && g.players >= minPlayers(this.env));
+    return !!(g && !g.removed && g.leader && g.leader.hardPoints >= minPoints(this.env) && g.players >= minPlayers(this.env));
   }
 
   whyNot(g, userId) {
