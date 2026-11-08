@@ -70,6 +70,34 @@ const ACTIVE_WINDOW_MS = 7 * 24 * 3600 * 1000;
 const GATHER_NEED = 3;                 // сколько игроков нужно собрать, чтобы начать
 const GATHER_MS = 15 * 60 * 1000;      // сколько ждать сбора
 
+// ================== РЕЗЕРВНАЯ КОПИЯ В D1 ==================
+// Если в Cloudflare подключена база D1 с именем привязки DB — бот сам создаёт таблицы
+// и после каждого изменения очков сохраняет туда копию. Без DB всё работает как раньше.
+let dbReady = false;
+async function dbInit(env) {
+  if (!env.DB || dbReady) return !!env.DB;
+  await env.DB.batch([
+    env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS players (chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, name TEXT, points INTEGER DEFAULT 0, " +
+        "hard_points INTEGER DEFAULT 0, guessed INTEGER DEFAULT 0, explained INTEGER DEFAULT 0, led INTEGER DEFAULT 0, updated_at INTEGER, " +
+        "PRIMARY KEY (chat_id, user_id))"
+    ),
+    env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS groups (chat_id INTEGER PRIMARY KEY, title TEXT, username TEXT, level TEXT, players INTEGER, updated_at INTEGER)"
+    ),
+  ]);
+  dbReady = true;
+  return true;
+}
+
+function dbPlayerStmt(env, chatId, userId, s) {
+  return env.DB.prepare(
+    "INSERT INTO players (chat_id, user_id, name, points, hard_points, guessed, explained, led, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) " +
+      "ON CONFLICT(chat_id, user_id) DO UPDATE SET name = excluded.name, points = excluded.points, hard_points = excluded.hard_points, " +
+      "guessed = excluded.guessed, explained = excluded.explained, led = excluded.led, updated_at = excluded.updated_at"
+  ).bind(chatId, userId, s.name || "", s.points || 0, s.hardPoints || 0, s.guessed || 0, s.explained || 0, s.led || 0, Date.now());
+}
+
 // ================== МОДЕРАЦИЯ ==================
 const MAX_WARNS = 3;                          // 1 — предупреждение, 2 — мут, 3 — бан
 const MUTE_SEC = 24 * 60 * 60;                // мут на сутки
@@ -134,9 +162,12 @@ export default {
       const commands = await tg(env, "setMyCommands", { commands: COMMANDS });
       await tg(env, "setMyCommands", { commands: PRIVATE_COMMANDS, scope: { type: "all_private_chats" } });
 
+      const reindex = await registry(env, "reindex_all", {}).catch(() => ({}));
       if (me.ok && webhook.ok && commands.ok) {
         return text(
           `✅ Готово! Бот @${me.result.username} подключён.\n` +
+            `📊 Статистика групп обновлена: ${reindex.done ?? 0} из ${reindex.total ?? 0}\n` +
+            (env.DB ? "💾 Резервная копия в D1: подключена\n" : "⚠️ Резервная копия в D1 не подключена (нет привязки DB)\n") +
             (env.OWNER_ID ? `👑 Владелец: ${env.OWNER_ID}` : "⚠️ OWNER_ID не задан — команды Арены работать не будут.")
         );
       }
@@ -508,9 +539,19 @@ export class CrocodileGame extends DurableObject {
       if (path === "/user") return Response.json(await this.userInfo(Number(body.uid)));
       if (path === "/topdata") return Response.json({ title: this.meta.title, lines: await this.topLines(10) });
       if (path === "/snapshot") return Response.json(await this.snapshot());
+      if (path === "/reindex") {
+        await this.dbRestore();
+        await this.report();
+        return Response.json({ ok: true });
+      }
       await this.rememberChat(
         body.message?.chat || body.callback_query?.message?.chat || body.chat_join_request?.chat || body.my_chat_member?.chat
       );
+      if (!this.reported && this.meta.chatId && !this.isArena) {
+        this.reported = true; // раз за "пробуждение": проверить копию, обновить реестр, подтянуть игроков в меню
+        await this.dbRestore();
+        await this.report();
+      }
       if (body.my_chat_member) await this.onMyChatMember(body.my_chat_member);
       else if (body.callback_query) await this.onCallback(body.callback_query);
       else if (body.message) await this.onMessage(body.message);
@@ -654,6 +695,59 @@ export class CrocodileGame extends DurableObject {
       s.name = name;
       for (const k of Object.keys(delta)) s[k] = (s[k] || 0) + delta[k];
       await this.ctx.storage.put(key, s);
+      if (key.startsWith("u:")) await this.dbSave(userId, s);
+    }
+  }
+
+  // ---------- резервная копия в D1 ----------
+  async dbSave(userId, s) {
+    if (!this.meta.chatId) return;
+    try {
+      if (await dbInit(this.env)) await dbPlayerStmt(this.env, this.meta.chatId, userId, s).run();
+    } catch (e) {
+      console.log("D1 save failed", String(e));
+    }
+  }
+
+  // Разово выгрузить всю статистику группы в D1 (для данных, набранных до подключения базы)
+  async dbSyncAll() {
+    if (!this.meta.chatId || (await this.ctx.storage.get("dbSynced"))) return;
+    try {
+      if (!(await dbInit(this.env))) return;
+      const all = await this.ctx.storage.list({ prefix: "u:" });
+      const stmts = [...all.entries()].map(([k, s]) => dbPlayerStmt(this.env, this.meta.chatId, Number(k.slice(2)), s));
+      for (let i = 0; i < stmts.length; i += 50) await this.env.DB.batch(stmts.slice(i, i + 50));
+      await this.ctx.storage.put("dbSynced", true);
+    } catch (e) {
+      console.log("D1 sync failed", String(e));
+    }
+  }
+
+  // Если локальная статистика пуста, а в D1 есть копия — восстановить
+  async dbRestore() {
+    if (!this.meta.chatId) return;
+    try {
+      if (!(await dbInit(this.env))) return;
+      const local = await this.ctx.storage.list({ prefix: "u:", limit: 1 });
+      if (local.size) return;
+      const { results } = await this.env.DB.prepare("SELECT * FROM players WHERE chat_id = ?1").bind(this.meta.chatId).all();
+      if (!results?.length) return;
+      const entries = {};
+      for (const r of results) {
+        entries["u:" + r.user_id] = {
+          name: r.name, points: r.points, hardPoints: r.hard_points, guessed: r.guessed, explained: r.explained, led: r.led,
+        };
+      }
+      const keys = Object.keys(entries);
+      for (let i = 0; i < keys.length; i += 100) {
+        const part = {};
+        for (const k of keys.slice(i, i + 100)) part[k] = entries[k];
+        await this.ctx.storage.put(part);
+      }
+      await this.ctx.storage.put("dbSynced", true);
+      console.log("restored from D1", this.meta.chatId, keys.length);
+    } catch (e) {
+      console.log("D1 restore failed", String(e));
     }
   }
 
@@ -733,6 +827,19 @@ export class CrocodileGame extends DurableObject {
 
   async report() {
     if (this.isArena || !this.meta.chatId) return;
+    await this.dbSyncAll();
+    try {
+      if (await dbInit(this.env)) {
+        const snap = await this.snapshot();
+        await this.env.DB.prepare(
+          "INSERT INTO groups (chat_id, title, username, level, players, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) " +
+            "ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title, username = excluded.username, level = excluded.level, " +
+            "players = excluded.players, updated_at = excluded.updated_at"
+        ).bind(snap.chatId, snap.title || "", snap.username || "", snap.level || "", snap.players || 0, Date.now()).run();
+      }
+    } catch (e) {
+      console.log("D1 group save failed", String(e));
+    }
     try {
       await this.backfillIndex();
       await this.registry("report", { snap: await this.snapshot() });
@@ -881,20 +988,21 @@ export class CrocodileGame extends DurableObject {
       if (me.username && target.toLowerCase() !== me.username.toLowerCase()) return; // команда другому боту
     }
     switch (cmdRaw.toLowerCase()) {
-      case "/game":
       case "/start":
+        if (!target) return; // голый /start в группе часто адресован другим ботам — молчим
+        return this.cmdGame(msg, anonAdmin);
+      case "/game":
       case "/croc":
       case "/crocodile":
         return this.cmdGame(msg, anonAdmin);
       case "/top":
         if (this.isArena) return this.cmdTop(msg);
-        return this.toBot(msg, "top_" + msg.chat.id, "🏆 Таблица лидеров группы — в меню бота 👇", "🏆 Открыть рейтинг");
+        return; // статистика — только в личке бота
       case "/me":
       case "/stats":
-        return this.toBot(msg, "me", "📊 Твоя статистика — в меню бота 👇", "📊 Моя статистика");
+        return; // статистика — только в личке бота
       case "/challenge":
-        if (this.isArena) return;
-        return this.toBot(msg, "arena", "⚔️ Вызов на Супер-игру — в меню бота 👇", "🏟 Супер-игра");
+        return; // вызов — только в личке бота
       case "/settings":
         return this.cmdSettings(msg, anonAdmin);
       case "/stop":
@@ -2040,6 +2148,7 @@ export class ArenaRegistry extends DurableObject {
       else if (path === "user_groups") out = await this.userGroups(Number(body.uid));
       else if (path === "global_top") out = await this.globalTop();
       else if (path === "lobby_public") out = await this.lobbyPublic();
+      else if (path === "reindex_all") out = await this.reindexAll();
       else if (path === "is_official") out = { official: String((await this.ctx.storage.get("official")) || "") === String(body.chatId) };
     } catch (e) {
       console.log("registry error", e?.stack || String(e));
@@ -2139,6 +2248,22 @@ export class ArenaRegistry extends DurableObject {
       .slice(0, 10)
       .map((g) => ({ name: g.leader.name, points: g.leader.points, no: g.no, titles: g.titles || 0 }));
     return { items };
+  }
+
+  // Подтянуть игроков всех известных групп в меню (после обновления)
+  async reindexAll() {
+    const all = [...(await this.ctx.storage.list({ prefix: "g:" })).values()].filter((g) => !g.removed);
+    let done = 0;
+    for (const g of all) {
+      try {
+        const stub = this.env.GAME.get(this.env.GAME.idFromName(String(g.chatId)));
+        await stub.fetch("https://game/reindex", { method: "POST", body: "{}" });
+        done++;
+      } catch (e) {
+        console.log("reindex failed", g.chatId, String(e));
+      }
+    }
+    return { ok: true, done, total: all.length };
   }
 
   async lobbyPublic() {
