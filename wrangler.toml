@@ -20,5 +20,15 @@ new_sqlite_classes = ["CrocodileGame"]
 tag = "v2"
 new_sqlite_classes = ["ArenaRegistry"]
 
+# Резервная копия статистики (база D1 crocodile-db)
+[[d1_databases]]
+binding = "DB"
+database_name = "crocodile-db"
+database_id = "56ba9858-45db-44e7-b332-d07f979d4646"
+
+# Каждый час бот проверяет "живые" группы: загадка дня, вечерняя игра, итоги недели
+[triggers]
+crons = ["0 * * * *"]
+
 [observability]
 enabled = true
