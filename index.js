@@ -41,9 +41,6 @@ const lobbySize = (env) => Number(env.ARENA_LOBBY_SIZE) || 4;
 
 const COMMANDS = [
   { command: "game", description: "🐊 Начать игру" },
-  { command: "top", description: "🏆 Таблица лидеров группы" },
-  { command: "me", description: "📊 Моя статистика" },
-  { command: "challenge", description: "⚔️ Вызов на Супер-игру (для лидера группы)" },
   { command: "settings", description: "⚙️ Сложность и время (админы)" },
   { command: "catalog", description: "📋 Показать группу в каталоге игр (админы)" },
   { command: "moderation", description: "🛡 Фильтр мата, рекламы и ссылок (админы)" },
@@ -53,7 +50,7 @@ const COMMANDS = [
 ];
 
 const PRIVATE_COMMANDS = [
-  { command: "start", description: "🎮 Меню: найти группу для игры" },
+  { command: "start", description: "🐊 Главное меню" },
   { command: "myid", description: "🆔 Мой Telegram ID" },
 ];
 const CATALOG_PAGE = 8; // групп на одной странице каталога
@@ -93,7 +90,7 @@ const HOW_TO_PLAY =
   "2. Ведущий объясняет слово в чате, не называя его и однокоренные слова.\n" +
   "3. Остальные пишут догадки. Падежи и мелкие опечатки засчитываются.\n" +
   "4. Кто первым угадал — получает очки. Ведущий тоже получает очки за хорошее объяснение.\n" +
-  "5. Очки копятся, у каждой группы своя таблица лидеров — /top.";
+  "5. Очки копятся, у каждой группы своя таблица лидеров. Статистика и рейтинги — в меню бота (личка → /start).";
 
 function rulesText(s, env) {
   s = s || DEFAULT_SETTINGS;
@@ -218,7 +215,173 @@ async function handlePrivate(env, msg) {
     return tg(env, "sendMessage", { chat_id: msg.chat.id, parse_mode: "HTML", text: res.text });
   }
 
-  return sendCatalog(env, msg.chat.id, 0, null);
+  // /start с параметром из группы: me, top_<id>, arena
+  const payload = cmd === "/start" ? (msg.text.trim().split(/\s+/)[1] || "") : "";
+  if (payload === "me") return screenMe(env, msg.chat.id, msg.from, null);
+  if (payload === "arena") return screenArena(env, msg.chat.id, msg.from, null);
+  if (payload.startsWith("top_")) return screenGroupTop(env, msg.chat.id, msg.from, payload.slice(4), null);
+  if (payload === "catalog") return sendCatalog(env, msg.chat.id, 0, null);
+  return screenMain(env, msg.chat.id, msg.from, null);
+}
+
+// ---------- Меню в личке ----------
+const BACK = [{ text: "⬅️ Меню", callback_data: "menu" }];
+
+function showScreen(env, chatId, msgId, html, rows) {
+  const body = { chat_id: chatId, text: html, parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: { inline_keyboard: rows } };
+  if (msgId) return tg(env, "editMessageText", { ...body, message_id: msgId });
+  return tg(env, "sendMessage", body);
+}
+
+function gameStub(env, chatId) {
+  return env.GAME.get(env.GAME.idFromName(String(chatId)));
+}
+
+async function groupCall(env, chatId, path, body = {}) {
+  const res = await gameStub(env, chatId).fetch("https://game/" + path, { method: "POST", body: JSON.stringify(body) });
+  return res.json();
+}
+
+async function screenMain(env, chatId, user, msgId) {
+  const me = await tg(env, "getMe", {});
+  const username = me.result?.username;
+  const rows = [
+    [{ text: "🎮 Найти группу для игры", callback_data: "cat:0" }],
+    [{ text: "📊 Моя статистика", callback_data: "me" }, { text: "🏆 Рейтинги", callback_data: "tops" }],
+    [{ text: "🏟 Супер-игра", callback_data: "arena" }, { text: "📖 Как играть", callback_data: "howto" }],
+  ];
+  if (username) rows.push([{ text: "➕ Добавить бота в свою группу", url: `https://t.me/${username}?startgroup=true` }]);
+  return showScreen(
+    env,
+    chatId,
+    msgId,
+    `🐊 <b>Крокодил — главное меню</b>\n\nПривет, <b>${esc(displayName(user))}</b>! 👋\n` +
+      "Играем в группах, а здесь — твоя статистика, рейтинги и Супер-игра.\n\nВыбирай 👇",
+    rows
+  );
+}
+
+async function userGroupsInfo(env, uid) {
+  const res = await registry(env, "user_groups", { uid });
+  const out = [];
+  for (const g of res.groups || []) {
+    try {
+      const info = await groupCall(env, g.chatId, "user", { uid });
+      if (info.stats) out.push({ ...info, no: g.no });
+    } catch (e) {
+      console.log("user info failed", g.chatId, String(e));
+    }
+  }
+  return out.sort((a, b) => (b.stats.points || 0) - (a.stats.points || 0));
+}
+
+async function screenMe(env, chatId, user, msgId) {
+  const groups = await userGroupsInfo(env, user.id);
+  if (!groups.length) {
+    return showScreen(env, chatId, msgId, "📊 <b>Моя статистика</b>\n\nТы ещё не набрал очков ни в одной группе.\nНайди группу и сыграй первый раунд 👇", [
+      [{ text: "🎮 Найти группу для игры", callback_data: "cat:0" }],
+      BACK,
+    ]);
+  }
+  const total = groups.reduce((a, g) => a + (g.stats.points || 0), 0);
+  const guessed = groups.reduce((a, g) => a + (g.stats.guessed || 0), 0);
+  const explained = groups.reduce((a, g) => a + (g.stats.explained || 0), 0);
+  let html =
+    `📊 <b>Статистика: ${esc(displayName(user))}</b>\n\n` +
+    `⭐ Всего очков: <b>${total}</b>\n🎯 Угадано слов: ${guessed} · 🎤 Объяснено: ${explained}\n\n`;
+  for (const g of groups.slice(0, 8)) {
+    const s = g.stats;
+    html +=
+      `<b>${esc(g.title || "Группа")}</b>\n` +
+      `   🏅 ${g.place} место из ${g.total} · ⭐ ${s.points} · 🔥 ${s.hardPoints || 0}/${minPoints(env)}` +
+      (g.place === 1 ? " · 👑 лидер" : "") +
+      "\n";
+  }
+  const rows = [[{ text: "🏆 Рейтинги моих групп", callback_data: "tops" }]];
+  if (groups.some((g) => g.eligible)) rows.push([{ text: "⚔️ Бросить вызов на Супер-игру", callback_data: "arena" }]);
+  rows.push(BACK);
+  return showScreen(env, chatId, msgId, html + "\n🔥 — очки на 🔴 Сложном и 💀 Ультимейте (для Супер-игры)", rows);
+}
+
+async function screenTops(env, chatId, user, msgId) {
+  const groups = await userGroupsInfo(env, user.id);
+  const rows = groups.slice(0, 10).map((g) => [{ text: `🏆 ${String(g.title || "Группа").slice(0, 40)}`, callback_data: "gt:" + g.chatId }]);
+  rows.push([{ text: "🌍 Лучшие игроки всех групп", callback_data: "gtop" }]);
+  rows.push(BACK);
+  return showScreen(
+    env,
+    chatId,
+    msgId,
+    "🏆 <b>Рейтинги</b>\n\n" + (groups.length ? "Выбери группу, чтобы увидеть её таблицу лидеров:" : "Ты пока не играл в группах — но можно посмотреть общий топ 👇"),
+    rows
+  );
+}
+
+async function screenGroupTop(env, chatId, user, groupId, msgId) {
+  const mine = await registry(env, "user_groups", { uid: user.id });
+  if (!(mine.groups || []).some((g) => String(g.chatId) === String(groupId))) {
+    return showScreen(env, chatId, msgId, "Эта таблица доступна только игрокам группы.", [BACK]);
+  }
+  const res = await groupCall(env, groupId, "topdata", {});
+  return showScreen(
+    env,
+    chatId,
+    msgId,
+    `🏆 <b>${esc(res.title || "Группа")}</b> — таблица лидеров\n\n` + (res.lines || "Пока пусто") + "\n\n🎯 угадал · 🎤 объяснил",
+    [[{ text: "⬅️ Все рейтинги", callback_data: "tops" }], BACK]
+  );
+}
+
+async function screenGlobalTop(env, chatId, msgId) {
+  const res = await registry(env, "global_top", {});
+  const medals = ["🥇", "🥈", "🥉"];
+  const lines = (res.items || []).map(
+    (x, i) => `${medals[i] || i + 1 + "."} <b>${esc(x.name)}</b> — ${x.points} (Группа #${x.no}${x.titles ? " · 👑 " + x.titles : ""})`
+  );
+  return showScreen(
+    env,
+    chatId,
+    msgId,
+    "🌍 <b>Лучшие игроки всех групп</b>\n<i>лидеры своих групп по очкам</i>\n\n" + (lines.join("\n") || "Пока пусто"),
+    [[{ text: "⬅️ Все рейтинги", callback_data: "tops" }], BACK]
+  );
+}
+
+async function screenArena(env, chatId, user, msgId, note = "") {
+  const groups = await userGroupsInfo(env, user.id);
+  const lobby = await registry(env, "lobby_public", {});
+  const need = minPoints(env);
+  const best = groups.slice().sort((a, b) => (b.stats.hardPoints || 0) - (a.stats.hardPoints || 0))[0];
+  let html =
+    "🏟 <b>Супер-игра</b>\n\n" +
+    `Лидеры групп (№1 в своей группе), набравшие <b>${need}+ 🔥 очков</b> на 🔴 Сложном или 💀 Ультимейте, ` +
+    `бросают вызов друг другу и сражаются на Арене за звание чемпиона 👑\n\n`;
+  html += best
+    ? `🔥 Твой лучший прогресс: <b>${best.stats.hardPoints || 0}/${need}</b> (${esc(best.title || "группа")}, ${best.place} место)\n`
+    : "🔥 Ты пока не набрал очков на сложном уровне.\n";
+  html += lobby.status
+    ? `\n⚔️ Лобби: ${lobby.status === "open" ? "набирается" : "собрано, скоро матч"} (${lobby.count}/${lobby.size})\n`
+    : "\n⚔️ Открытого лобби сейчас нет.\n";
+  const rows = [];
+  for (const g of groups.filter((x) => x.eligible).slice(0, 3)) {
+    rows.push([{ text: `⚔️ Бросить вызов (от «${String(g.title || "группы").slice(0, 25)}»)`, callback_data: "pch:" + g.chatId }]);
+  }
+  if (!rows.length && best) html += "\nЧтобы бросить вызов, стань №1 в группе и набери нужные 🔥 очки.";
+  rows.push(BACK);
+  return showScreen(env, chatId, msgId, html + (note ? "\n\n" + note : ""), rows);
+}
+
+async function screenHowto(env, chatId, msgId) {
+  return showScreen(
+    env,
+    chatId,
+    msgId,
+    "📖 <b>Как играть</b>\n\n" +
+      HOW_TO_PLAY +
+      "\n\n🏟 <b>Супер-игра:</b> лидеры групп с 1000+ очков на 🔴 Сложном или 💀 Ультимейте " +
+      "бросают вызов друг другу и сражаются на Арене за звание чемпиона.",
+    [[{ text: "🎮 Найти группу для игры", callback_data: "cat:0" }], BACK]
+  );
 }
 
 // ---------- Меню в личке: каталог групп ----------
@@ -261,7 +424,7 @@ async function sendCatalog(env, chatId, page, editMsgId) {
     }
   }
   if (username) rows.push([{ text: "➕ Добавить бота в свою группу", url: `https://t.me/${username}?startgroup=true` }]);
-  rows.push([{ text: "📖 Как играть", callback_data: "howto" }, { text: "🔄 Обновить", callback_data: "cat:" + (cat.page || 0) }]);
+  rows.push([{ text: "🔄 Обновить", callback_data: "cat:" + (cat.page || 0) }, { text: "⬅️ Меню", callback_data: "menu" }]);
 
   const body = { chat_id: chatId, text: html, parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_markup: { inline_keyboard: rows } };
   if (editMsgId) return tg(env, "editMessageText", { ...body, message_id: editMsgId });
@@ -270,22 +433,29 @@ async function sendCatalog(env, chatId, page, editMsgId) {
 
 async function handlePrivateCallback(env, cq) {
   const data = String(cq.data || "");
+  const chatId = cq.message.chat.id;
+  const msgId = cq.message.message_id;
+  const user = cq.from;
+  const ack = (t = "", alert = false) => tg(env, "answerCallbackQuery", { callback_query_id: cq.id, text: t, show_alert: alert });
+
   if (data.startsWith("cat:")) {
-    await tg(env, "answerCallbackQuery", { callback_query_id: cq.id });
-    return sendCatalog(env, cq.message.chat.id, Math.max(0, Number(data.slice(4)) || 0), cq.message.message_id);
+    await ack();
+    return sendCatalog(env, chatId, Math.max(0, Number(data.slice(4)) || 0), msgId);
   }
-  if (data === "howto") {
-    await tg(env, "answerCallbackQuery", { callback_query_id: cq.id });
-    return tg(env, "sendMessage", {
-      chat_id: cq.message.chat.id,
-      parse_mode: "HTML",
-      text:
-        HOW_TO_PLAY +
-        "\n\n🏟 <b>Супер-игра:</b> лидеры групп с 1000+ очков на 🔴 Сложном или 💀 Ультимейте " +
-        "бросают вызов друг другу и сражаются на Арене за звание чемпиона.\n\nВернуться к списку групп — /start",
-    });
+  if (data === "menu") return ack().then(() => screenMain(env, chatId, user, msgId));
+  if (data === "me") return ack().then(() => screenMe(env, chatId, user, msgId));
+  if (data === "tops") return ack().then(() => screenTops(env, chatId, user, msgId));
+  if (data === "gtop") return ack().then(() => screenGlobalTop(env, chatId, msgId));
+  if (data === "arena") return ack().then(() => screenArena(env, chatId, user, msgId));
+  if (data === "howto") return ack().then(() => screenHowto(env, chatId, msgId));
+  if (data.startsWith("gt:")) return ack().then(() => screenGroupTop(env, chatId, user, data.slice(3), msgId));
+  if (data.startsWith("pch:")) {
+    await ack("⚔️ Отправляем вызов…");
+    const snap = await groupCall(env, data.slice(4), "snapshot", {});
+    const res = await registry(env, "challenge", { snap, userId: user.id });
+    return screenArena(env, chatId, user, msgId, res.text || "");
   }
-  return tg(env, "answerCallbackQuery", { callback_query_id: cq.id });
+  return ack();
 }
 
 function isOwnerId(env, userId) {
@@ -335,6 +505,9 @@ export class CrocodileGame extends DurableObject {
     try {
       if (path === "/allow") return Response.json(await this.allowPlayers(body.ids || []));
       if (path === "/tick") return Response.json(await this.onTick(body));
+      if (path === "/user") return Response.json(await this.userInfo(Number(body.uid)));
+      if (path === "/topdata") return Response.json({ title: this.meta.title, lines: await this.topLines(10) });
+      if (path === "/snapshot") return Response.json(await this.snapshot());
       await this.rememberChat(
         body.message?.chat || body.callback_query?.message?.chat || body.chat_join_request?.chat || body.my_chat_member?.chat
       );
@@ -473,6 +646,7 @@ export class CrocodileGame extends DurableObject {
       wk.p[userId] = e;
       await this.ctx.storage.put("week", wk);
     }
+    if (!this.isArena) await this.indexUser(userId);
     const keys = ["u:" + userId];
     if (this.isArena) keys.push("m:" + userId); // отдельный зачёт текущего матча Арены
     for (const key of keys) {
@@ -481,6 +655,45 @@ export class CrocodileGame extends DurableObject {
       for (const k of Object.keys(delta)) s[k] = (s[k] || 0) + delta[k];
       await this.ctx.storage.put(key, s);
     }
+  }
+
+  // Индекс "игрок → группы" в общем реестре (для меню в личке)
+  async indexUser(userId) {
+    if (!this.meta.chatId) return;
+    if (!this.indexed) this.indexed = new Set((await this.ctx.storage.get("idx")) || []);
+    if (this.indexed.has(userId)) return;
+    this.indexed.add(userId);
+    await this.ctx.storage.put("idx", [...this.indexed]);
+    try {
+      await this.registry("user_join", { uids: [userId], chatId: this.meta.chatId });
+    } catch (e) {
+      console.log("index failed", String(e));
+    }
+  }
+
+  // Разово: проиндексировать игроков, набравших очки до обновления
+  async backfillIndex() {
+    if (this.isArena || !this.meta.chatId || (await this.ctx.storage.get("idxDone"))) return;
+    const ids = [...(await this.ctx.storage.list({ prefix: "u:" })).keys()].map((k) => Number(k.slice(2)));
+    if (ids.length) await this.registry("user_join", { uids: ids, chatId: this.meta.chatId });
+    this.indexed = new Set(ids);
+    await this.ctx.storage.put({ idx: ids, idxDone: true });
+  }
+
+  async userInfo(uid) {
+    await this.backfillIndex();
+    const sorted = await this.playersSorted();
+    const idx = sorted.findIndex((s) => s.id === uid);
+    const me = idx >= 0 ? sorted[idx] : null;
+    return {
+      chatId: this.meta.chatId,
+      title: this.meta.title,
+      isArena: this.isArena,
+      place: idx + 1,
+      total: sorted.length,
+      stats: me,
+      eligible: !this.isArena && idx === 0 && (me?.hardPoints || 0) >= minPoints(this.env) && sorted.length >= minPlayers(this.env),
+    };
   }
 
   // Защита от накрутки: одна пара "ведущий → угадавший" не больше N зачётных раундов в день
@@ -521,6 +734,7 @@ export class CrocodileGame extends DurableObject {
   async report() {
     if (this.isArena || !this.meta.chatId) return;
     try {
+      await this.backfillIndex();
       await this.registry("report", { snap: await this.snapshot() });
     } catch (e) {
       console.log("report failed", String(e));
@@ -673,12 +887,14 @@ export class CrocodileGame extends DurableObject {
       case "/crocodile":
         return this.cmdGame(msg, anonAdmin);
       case "/top":
-        return this.cmdTop(msg);
+        if (this.isArena) return this.cmdTop(msg);
+        return this.toBot(msg, "top_" + msg.chat.id, "🏆 Таблица лидеров группы — в меню бота 👇", "🏆 Открыть рейтинг");
       case "/me":
       case "/stats":
-        return this.cmdMe(msg);
+        return this.toBot(msg, "me", "📊 Твоя статистика — в меню бота 👇", "📊 Моя статистика");
       case "/challenge":
-        return this.cmdChallenge(msg);
+        if (this.isArena) return;
+        return this.toBot(msg, "arena", "⚔️ Вызов на Супер-игру — в меню бота 👇", "🏟 Супер-игра");
       case "/settings":
         return this.cmdSettings(msg, anonAdmin);
       case "/stop":
@@ -1276,9 +1492,10 @@ export class CrocodileGame extends DurableObject {
     this.round = r;
     await this.save();
     if (oldMsgId) await this.removeButtons(chatId, oldMsgId);
-    const res = await this.send(chatId, text, {
-      reply_markup: kb([[[`▶️ Продолжить: ${catName(ses.cat)}`, "cont"]], [["🗳 Выбрать другую категорию", "newcat"]]]),
-    });
+    const me = await this.getMe();
+    const rows = kb([[[`▶️ Продолжить: ${catName(ses.cat)}`, "cont"]], [["🗳 Выбрать другую категорию", "newcat"]]]).inline_keyboard;
+    if (me.username) rows.push([{ text: "📊 Моя статистика", url: `https://t.me/${me.username}?start=me` }]);
+    const res = await this.send(chatId, text, { reply_markup: { inline_keyboard: rows } });
     if (this.round !== r) return;
     if (!res.ok) {
       this.round = { status: "idle" };
@@ -1558,6 +1775,16 @@ export class CrocodileGame extends DurableObject {
     );
   }
 
+  // Короткий ответ в группе с кнопкой в личку бота
+  async toBot(msg, payload, text, button) {
+    const me = await this.getMe();
+    if (!me.username) return;
+    return this.send(msg.chat.id, text, {
+      reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
+      reply_markup: { inline_keyboard: [[{ text: button, url: `https://t.me/${me.username}?start=${payload}` }]] },
+    });
+  }
+
   // ---------- каталог групп ----------
   catalogText(st) {
     return (
@@ -1809,6 +2036,10 @@ export class ArenaRegistry extends DurableObject {
       else if (path === "set_listed") out = await this.setListed(body.snap, body.listed, body.invite);
       else if (path === "set_official") out = await this.setOfficial(body.snap, body.invite);
       else if (path === "alive_groups") out = await this.aliveGroups();
+      else if (path === "user_join") out = await this.userJoin(body.uids || [], body.chatId);
+      else if (path === "user_groups") out = await this.userGroups(Number(body.uid));
+      else if (path === "global_top") out = await this.globalTop();
+      else if (path === "lobby_public") out = await this.lobbyPublic();
       else if (path === "is_official") out = { official: String((await this.ctx.storage.get("official")) || "") === String(body.chatId) };
     } catch (e) {
       console.log("registry error", e?.stack || String(e));
@@ -1874,6 +2105,46 @@ export class ArenaRegistry extends DurableObject {
     if (invite) g.invite = invite;
     await this.ctx.storage.put("g:" + g.chatId, g);
     return this.catalogState(g);
+  }
+
+  // ---------- игроки и их группы (для меню в личке) ----------
+  async userJoin(uids, chatId) {
+    for (const uid of uids) {
+      const key = "ug:" + uid;
+      const list = (await this.ctx.storage.get(key)) || [];
+      if (!list.some((c) => String(c) === String(chatId))) {
+        list.push(chatId);
+        await this.ctx.storage.put(key, list);
+      }
+    }
+    return { ok: true };
+  }
+
+  async userGroups(uid) {
+    const list = (await this.ctx.storage.get("ug:" + uid)) || [];
+    const arena = await this.ctx.storage.get("arena");
+    const groups = [];
+    for (const chatId of list) {
+      if (arena && String(arena.chatId) === String(chatId)) continue;
+      const g = await this.ctx.storage.get("g:" + chatId);
+      if (g && !g.removed) groups.push({ chatId, title: g.title, no: g.no });
+    }
+    return { groups };
+  }
+
+  async globalTop() {
+    const all = [...(await this.ctx.storage.list({ prefix: "g:" })).values()].filter((g) => !g.removed && g.leader && g.leader.points > 0);
+    const items = all
+      .sort((a, b) => b.leader.points - a.leader.points)
+      .slice(0, 10)
+      .map((g) => ({ name: g.leader.name, points: g.leader.points, no: g.no, titles: g.titles || 0 }));
+    return { items };
+  }
+
+  async lobbyPublic() {
+    const lobby = await this.ctx.storage.get("lobby");
+    if (!lobby) return {};
+    return { status: lobby.status, count: lobby.participants.length, size: lobbySize(this.env) };
   }
 
   async aliveGroups() {
