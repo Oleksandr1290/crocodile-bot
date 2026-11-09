@@ -27,8 +27,8 @@ const DEFAULT_SETTINGS = { level: "medium", timed: true, timeSec: 300 };
 const SESSION_WORDS = 10;         // слов в раунде по умолчанию
 const WORD_OPTIONS = [5, 10, 15, 20];
 const TIME_VOTE_OPTIONS = [60, 120, 180, 300, 0]; // 0 = без ограничения времени
-const VOTE_MS = 30 * 1000;        // максимум на голосование
-const VOTE_MIN_MS = 8 * 1000;     // раньше этого голосование не закрывается, даже если всё решено
+const VOTE_IDLE_MS = 15 * 60 * 1000; // настройку никто не трогает 15 минут → закрываем (ограничения по времени на выбор нет)
+const VOTE_ANYONE_MS = 2 * 60 * 1000; // если запустивший игру пропал — через 2 минуты «Начать» может любой игрок
 const LOBBY_MS = 15 * 1000;       // сбор игроков после /game
 const ROSTER_IDLE_MS = 10 * 60 * 1000; // кто 10 минут ничего не делал — выбывает из состава
 const CLASSIC_MIN = 2;            // классике нужно минимум 2 игрока
@@ -477,7 +477,7 @@ const RULES = {
       "🗳 <b>Как начинается игра</b>\n\n" +
       "1. Кто-то пишет /game — 15 секунд идёт сбор: жмите «🙋 Я играю». «▶️ Поехали» может нажать тот, кто запустил игру.\n" +
       "2. Игроки голосуют за настройки раунда: 📂 категория, 🎚 сложность, 🔢 количество слов (5–20) и ⏱ время на слово.\n" +
-      "3. Голосование заканчивается досрочно, когда все проголосовали за категорию или у лидера уже не отнять первое место.\n" +
+      "3. Ограничения по времени на настройку нет. Когда все выбрали — тот, кто запустил игру, жмёт «▶️ Начать игру» (если он пропал — через 2 минуты может любой игрок).\n" +
       "4. После раунда: «▶️ Продолжить с теми же настройками» или «🔧 Изменить настройки».\n\n" +
       "⏰ Опоздал? Просто напиши вариант ответа — ты в игре.\n" +
       "💤 Кто 10 минут ничего не делает, выбывает из состава.",
@@ -1839,6 +1839,7 @@ export class CrocodileGame extends DurableObject {
     rows.push(WORD_OPTIONS.map((n) => [label("words", String(n), String(n), r.def.words), "vw:" + n]));
     rows.push(head("— ⏱ Время на слово —"));
     rows.push(TIME_VOTE_OPTIONS.map((t) => [label("time", String(t), t ? `${t / 60} мин` : "∞", r.def.time), "vt:" + t]));
+    rows.push([["▶️ Начать игру", "vgo"]]);
     return kb(rows);
   }
 
@@ -1848,7 +1849,8 @@ export class CrocodileGame extends DurableObject {
     return (
       (r.header ? r.header + "\n\n" : "") +
       `🗳 <b>Настройка раунда</b> · в игре ${players.length}\n` +
-      `Голосуйте в каждой строке — до ${Math.round(VOTE_MS / 1000)} сек. Как только большинство определится с категорией, начнём.\n` +
+      "Голосуйте в каждой строке — не спешите, времени сколько угодно.\n" +
+      (r.initiator ? `Когда все готовы — <b>${esc(r.initiatorName || "запустивший игру")}</b> жмёт «▶️ Начать игру».\n` : "Когда все готовы — жмите «▶️ Начать игру».\n") +
       "✓ — что выбрано сейчас (если не голосовать, останется так)." +
       (r.solo ? `\n\n👤 Ты один — объяснять будет 🐊 Крокодил (или выбирай 🏳️ Флаги). Чтобы объясняли игроки, нужно ${CLASSIC_MIN}+ человека.` : "") +
       (voted.size ? `\n\n🙋 Проголосовали: ${voted.size} из ${Math.max(players.length, voted.size)}` : "")
@@ -1868,7 +1870,8 @@ export class CrocodileGame extends DurableObject {
   async startVote(chatId, header = "", oldMsgId = null) {
     const now = Date.now();
     const r = {
-      status: "vote", chatId, header, msgId: null, startedAt: now, deadline: now + VOTE_MS,
+      status: "vote", chatId, header, msgId: null, startedAt: now, deadline: now + VOTE_IDLE_MS,
+      initiator: this.game?.initiator || null, initiatorName: this.game?.roster?.[this.game?.initiator]?.name || null,
       votes: { cat: {}, level: {}, words: {}, time: {}, mode: {} }, def: this.voteDefaults(),
       solo: this.activePlayers().length < CLASSIC_MIN,
     };
@@ -1888,6 +1891,7 @@ export class CrocodileGame extends DurableObject {
 
   async onVote(cq, data) {
     const r = this.round;
+    if (data === "vgo") return this.onVoteGo(cq);
     const [row, val] = String(data).split(":");
     const map = { vc: "cat", vl: "level", vw: "words", vt: "time", vm: "mode" };
     const key = map[row];
@@ -1902,11 +1906,29 @@ export class CrocodileGame extends DurableObject {
     r.votes[key][cq.from.id] = val;
     await this.save();
     await this.answer(cq, prev === val ? "Голос уже учтён 👍" : "Голос учтён ✅");
+    r.deadline = Date.now() + VOTE_IDLE_MS; // пока голосуют — настройка не закрывается
+    await this.save();
+    await this.ctx.storage.setAlarm(r.deadline);
     if (prev !== val) await this.edit(r.chatId, r.msgId, this.voteText(r), this.voteKeyboard(r));
-    if (this.voteDecided(r)) {
-      if (Date.now() - r.startedAt >= VOTE_MIN_MS) return this.finishVote();
-      await this.ctx.storage.setAlarm(r.startedAt + VOTE_MIN_MS); // дадим пару секунд проголосовать в других строках
+  }
+
+  // «▶️ Начать игру»: запустивший игру (или админ); если его нет — любой игрок через 2 минуты
+  async onVoteGo(cq) {
+    const r = this.round;
+    const uid = cq.from.id;
+    const may =
+      !r.initiator ||
+      uid === r.initiator ||
+      this.isOwner(uid) ||
+      Date.now() - r.startedAt >= VOTE_ANYONE_MS ||
+      (await this.isAdmin(r.chatId, uid));
+    if (!may) {
+      const left = Math.ceil((VOTE_ANYONE_MS - (Date.now() - r.startedAt)) / 1000);
+      return this.answer(cq, `Начать может ${r.initiatorName || "тот, кто запустил игру"}. Если он(а) пропал(а) — любой сможет через ${left} сек.`, true);
     }
+    if (this.round.status !== "vote") return this.answer(cq);
+    await this.answer(cq, "Поехали! 🚀");
+    return this.finishVote();
   }
 
   sessionSummary(ses) {
@@ -3387,8 +3409,11 @@ export class CrocodileGame extends DurableObject {
   async alarm() {
     const r = this.round;
     if (r.status === "vote") {
-      if (Date.now() >= r.deadline - 1000 || (this.voteDecided(r) && Date.now() - r.startedAt >= VOTE_MIN_MS - 500)) return this.finishVote();
-      return this.ctx.storage.setAlarm(r.deadline);
+      if (Date.now() < r.deadline - 1000) return this.ctx.storage.setAlarm(r.deadline);
+      // 15 минут никто ничего не нажимал — тихо закрываем настройку
+      this.round = { status: "idle" };
+      await this.save();
+      return this.edit(r.chatId, r.msgId, (r.header ? r.header + "\n\n" : "") + "💤 Настройку игры никто не трогал 15 минут — закрыл. Начать заново — /game");
     }
     if (r.status === "lobby") {
       if (Date.now() >= r.deadline - 1000) return this.finishLobby();
