@@ -39,7 +39,8 @@ const catName = (key) => (key === FLAG_CAT ? "🏳️ Флаги" : (CATEGORIES[
 // ================== ФЛАГИ ==================
 const FLAG_UNLOCK_MS = 60 * 1000;      // минута тишины → подсказки и пропуск доступны
 const FLAG_AUTOSKIP_MS = 2 * 60 * 1000; // ещё 2 минуты тишины → флаг пропускается сам
-const FLAG_REQUEUE = 3;                // пропущенный флаг вернётся через столько флагов
+const FLAG_REQUEUE = 3;
+const FLAG_TEAMS_MIN = 4;               // с 4 игроков во флагах можно играть команда на команду                // пропущенный флаг вернётся через столько флагов
 const flagLetterNeed = (players) => Math.min(8, 3 + Math.max(0, players - 2)); // промахов до покупки буквы
 const flagBasePrice = (level) => Math.max(1, Math.round((FLAG_VALUE[level] || 8) / 4));
 
@@ -331,7 +332,7 @@ async function userGroupsInfo(env, uid) {
   for (const g of res.groups || []) {
     try {
       const info = await groupCall(env, g.chatId, "user", { uid });
-      if (info.stats || info.croc) out.push({ ...info, no: g.no });
+      if (info.stats || info.croc || info.series) out.push({ ...info, no: g.no });
     } catch (e) {
       console.log("user info failed", g.chatId, String(e));
     }
@@ -351,6 +352,7 @@ async function screenMe(env, chatId, user, msgId) {
   const guessed = groups.reduce((a, g) => a + (g.stats?.guessed || 0), 0);
   const explained = groups.reduce((a, g) => a + (g.stats?.explained || 0), 0);
   const crocPts = groups.reduce((a, g) => a + (g.croc?.points || 0), 0);
+  const serLine = (ser) => Object.entries(ser).map(([lv, n]) => `${(LEVELS[lv] || LEVELS.medium).name} ${n}`).join(" · ");
   let html =
     `📊 <b>Статистика: ${esc(displayName(user))}</b>\n\n` +
     `⭐ Всего очков: <b>${total}</b>\n🎯 Угадано слов: ${guessed} · 🎤 Объяснено: ${explained}\n` +
@@ -363,7 +365,8 @@ async function screenMe(env, chatId, user, msgId) {
       (s
         ? `   🏅 ${g.place} место из ${g.total} · ⭐ ${s.points} · 🔥 ${s.hardPoints || 0}/${minPoints(env)}` + (g.place === 1 ? " · 👑 лидер" : "") + "\n"
         : "") +
-      (g.croc ? `   🐊 охотник: ${g.croc.points} очков · ${g.croc.wins} слов\n` : "");
+      (g.croc ? `   🐊 охотник: ${g.croc.points} очков · ${g.croc.wins} слов\n` : "") +
+      (g.series ? `   🏳️ лучшие серии: ${serLine(g.series)}\n` : "");
   }
   const rows = [[{ text: "🏆 Рейтинги моих групп", callback_data: "tops" }]];
   if (groups.some((g) => g.eligible)) rows.push([{ text: "⚔️ Бросить вызов на Супер-игру", callback_data: "arena" }]);
@@ -396,7 +399,8 @@ async function screenGroupTop(env, chatId, user, groupId, msgId) {
     chatId,
     msgId,
     `🏆 <b>${esc(res.title || "Группа")}</b> — таблица лидеров\n\n` + (res.lines || "Пока пусто") + "\n\n🎯 угадал · 🎤 объяснил" +
-      (res.croc ? "\n\n🐊 <b>Охотники на Крокодила</b>\n" + res.croc : ""),
+      (res.croc ? "\n\n🐊 <b>Охотники на Крокодила</b>\n" + res.croc : "") +
+      (res.series ? "\n\n🏳️ <b>Рекорды серий (флаги подряд)</b>\n" + res.series : ""),
     [[{ text: "⬅️ Все рейтинги", callback_data: "tops" }], BACK]
   );
 }
@@ -510,20 +514,25 @@ const RULES = {
   },
 };
 RULES.flags = {
-  button: "🏳️ Флаги и банк команды",
+  button: "🏳️ Флаги",
   text:
-    "🏳️ <b>Флаги — играем командой</b>\n\n" +
-    "Ведущего нет: бот показывает флаг, все пишут название страны. Кто первым угадал — пополняет общий 💰 банк команды " +
-    "(🟢 4 · 🟡 8 · 🔴 12 · 💀 20 очков за флаг).\n\n" +
-    "<b>Подсказки за очки банка</b>\n" +
-    "🔤 Буква — открывает случайную букву (и длину названия). Стоит четверть ценности флага, каждая следующая на 1 дороже.\n" +
-    "Кнопка появляется после нескольких неправильных ответов (3 при 1–2 игроках, +1 за игрока, максимум 8) или минуты тишины.\n" +
-    "⏭ Пропустить — бесплатно, ответ не показывается, флаг вернётся позже.\n" +
-    "👥 Если играют 3+ человек, покупку и пропуск подтверждают двое.\n\n" +
-    "💡 В начале раунда в банке есть стартовый капитал на 1 букву — только на первый флаг.\n" +
-    "😴 2 минуты тишины после подсказок — флаг пропускается. Два таких подряд — игра останавливается.\n\n" +
-    "🏁 В конце раунда банк делится <b>поровну</b> между всеми, кто дал хотя бы один ответ, и идёт в рейтинг. " +
-    "На 🔴/💀 при 3+ игроках очки засчитываются и для Супер-игры 🔥.",
+    "🏳️ <b>Флаги</b>\n\n" +
+    "Ведущего нет: бот показывает флаг, все пишут название страны. Очки за флаг: 🟢 4 · 🟡 8 · 🔴 12 · 💀 20.\n" +
+    "Проверка строгая: «Нигерия» на флаг Нигера — промах. Режим выбирается сам по числу игроков:\n\n" +
+    "👤 <b>Один игрок — серия на рекорд</b>\n" +
+    "Сколько флагов подряд угадаешь без ошибки? Ошибка — назвать другую страну. Букв и пропусков нет. " +
+    "Серия — тренировка: в рейтинг не идёт, но личные рекорды и рекорд группы видны в «🏆 Рейтинги». Побил рекорд группы — бот объявит об этом в чате!\n\n" +
+    "⚡ <b>2–3 игрока — каждый сам за себя</b>\n" +
+    "Кто первым угадал — забирает очки себе (в рейтинг). " +
+    "🔤 Букву можно купить за <b>свой рейтинг</b> (четверть ценности флага, каждая следующая на 1 дороже) — её видишь <b>только ты</b> во всплывающем окне. " +
+    "Купить или рискнуть и ждать? Пока думаешь — соперник может угадать.\n\n" +
+    "⚔️ <b>4+ игроков — на выбор при настройке:</b> каждый сам за себя или <b>🔴 против 🔵</b>. " +
+    "В командах у каждой свой банк (стартовый капитал на 1 букву — только на первый флаг), буквы покупаются из банка и видны только своей команде («👁 Наши буквы»). " +
+    "В конце банк команды делится поровну между её игроками, которые отвечали. Банк не уходит ниже 0.\n\n" +
+    "🔒 Буквы открываются после нескольких неправильных ответов (3 при 1–2 игроках, +1 за игрока, максимум 8) или минуты тишины.\n" +
+    "⏭ Пропуск — бесплатный, флаг вернётся позже. При 3+ игроках нужен второй голос, в командах — по голосу от каждой.\n" +
+    "😴 2 минуты тишины после открытия кнопок — флаг пропускается. Два таких подряд — игра останавливается.\n" +
+    "🔥 На 🔴/💀 при 3+ игроках очки идут и в зачёт Супер-игры.",
 };
 RULES.croc = {
   button: "🐊 Крокодил ведёт",
@@ -700,7 +709,7 @@ export class CrocodileGame extends DurableObject {
       if (path === "/panel") return Response.json(await this.arenaPanel(body.action, body.arg));
       if (path === "/tick") return Response.json(await this.onTick(body));
       if (path === "/user") return Response.json(await this.userInfo(Number(body.uid)));
-      if (path === "/topdata") return Response.json({ title: this.meta.title, lines: await this.topLines(10), croc: await this.crocTop(5) });
+      if (path === "/topdata") return Response.json({ title: this.meta.title, lines: await this.topLines(10), croc: await this.crocTop(5), series: await this.seriesTop() });
       if (path === "/snapshot") return Response.json(await this.snapshot());
       if (path === "/reindex") {
         await this.dbRestore();
@@ -966,6 +975,7 @@ export class CrocodileGame extends DurableObject {
     const croc = (await this.ctx.storage.get("c:" + uid)) || null;
     return {
       croc,
+      series: await this.seriesOf(uid),
       chatId: this.meta.chatId,
       title: this.meta.title,
       isArena: this.isArena,
@@ -1813,8 +1823,8 @@ export class CrocodileGame extends DurableObject {
 
   voteKeyboard(r) {
     const mark = (row, key, def) => {
-      const counts = this.rowTally(r.votes[row]);
-      const lead = this.rowWinner(r.votes[row], def, false);
+      const counts = this.rowTally(r.votes[row] || {});
+      const lead = this.rowWinner(r.votes[row] || {}, def, false);
       return (key === lead ? "✓ " : "") + (counts[key] ? ` · ${counts[key]}` : "");
     };
     const label = (row, key, text, def) => {
@@ -1831,6 +1841,13 @@ export class CrocodileGame extends DurableObject {
     rows.push(
       (r.solo ? ["croc"] : ["classic", "croc"]).map((m) => [label("mode", m, m === "croc" ? "🐊 Крокодил" : "🙋 Игроки", r.def.mode), "vm:" + m])
     );
+    if (this.activePlayers().length >= FLAG_TEAMS_MIN) {
+      rows.push(head("— 🏳️ Если флаги —"));
+      rows.push([
+        [label("fmode", "ffa", "👤 Каждый сам", this.session?.fpref || "ffa"), "vf:ffa"],
+        [label("fmode", "teams", "⚔️ 🔴 против 🔵", this.session?.fpref || "ffa"), "vf:teams"],
+      ]);
+    }
     rows.push(head("— 🎚 Сложность —"));
     const lv = Object.keys(LEVELS);
     rows.push(lv.slice(0, 2).map((k) => [label("level", k, LEVELS[k].name, r.def.level), "vl:" + k]));
@@ -1852,7 +1869,7 @@ export class CrocodileGame extends DurableObject {
       "Голосуйте в каждой строке — не спешите, времени сколько угодно.\n" +
       (r.initiator ? `Когда все готовы — <b>${esc(r.initiatorName || "запустивший игру")}</b> жмёт «▶️ Начать игру».\n` : "Когда все готовы — жмите «▶️ Начать игру».\n") +
       "✓ — что выбрано сейчас (если не голосовать, останется так)." +
-      (r.solo ? `\n\n👤 Ты один — объяснять будет 🐊 Крокодил (или выбирай 🏳️ Флаги). Чтобы объясняли игроки, нужно ${CLASSIC_MIN}+ человека.` : "") +
+      (r.solo ? `\n\n👤 Ты один — объяснять будет 🐊 Крокодил (или выбирай 🏳️ Флаги — серия на рекорд). Чтобы объясняли игроки, нужно ${CLASSIC_MIN}+ человека.` : "") +
       (voted.size ? `\n\n🙋 Проголосовали: ${voted.size} из ${Math.max(players.length, voted.size)}` : "")
     );
   }
@@ -1872,7 +1889,7 @@ export class CrocodileGame extends DurableObject {
     const r = {
       status: "vote", chatId, header, msgId: null, startedAt: now, deadline: now + VOTE_IDLE_MS,
       initiator: this.game?.initiator || null, initiatorName: this.game?.roster?.[this.game?.initiator]?.name || null,
-      votes: { cat: {}, level: {}, words: {}, time: {}, mode: {} }, def: this.voteDefaults(),
+      votes: { cat: {}, level: {}, words: {}, time: {}, mode: {}, fmode: {} }, def: this.voteDefaults(),
       solo: this.activePlayers().length < CLASSIC_MIN,
     };
     this.round = r;
@@ -1893,14 +1910,16 @@ export class CrocodileGame extends DurableObject {
     const r = this.round;
     if (data === "vgo") return this.onVoteGo(cq);
     const [row, val] = String(data).split(":");
-    const map = { vc: "cat", vl: "level", vw: "words", vt: "time", vm: "mode" };
+    const map = { vc: "cat", vl: "level", vw: "words", vt: "time", vm: "mode", vf: "fmode" };
     const key = map[row];
     const ok =
       (key === "cat" && (val === "any" || val === FLAG_CAT || CATEGORIES[val])) ||
       (key === "level" && LEVELS[val]) ||
       (key === "words" && WORD_OPTIONS.includes(Number(val))) ||
       (key === "time" && TIME_VOTE_OPTIONS.includes(Number(val))) ||
-      (key === "mode" && (val === "croc" || (val === "classic" && !r.solo)));
+      (key === "mode" && (val === "croc" || (val === "classic" && !r.solo))) ||
+      (key === "fmode" && (val === "ffa" || val === "teams"));
+    if (key === "fmode" && !r.votes.fmode) r.votes.fmode = {};
     if (!ok) return this.answer(cq);
     const prev = r.votes[key][cq.from.id];
     r.votes[key][cq.from.id] = val;
@@ -1932,7 +1951,11 @@ export class CrocodileGame extends DurableObject {
   }
 
   sessionSummary(ses) {
-    if (ses.cat === FLAG_CAT) return `${catName(FLAG_CAT)} · ${(LEVELS[ses.level] || LEVELS.medium).name} · ${ses.words} флагов`;
+    if (ses.cat === FLAG_CAT) {
+      const lv = (LEVELS[ses.level] || LEVELS.medium).name;
+      if (ses.fmode === "solo") return `${catName(FLAG_CAT)} · ${lv} · 🔥 серия`;
+      return `${catName(FLAG_CAT)} · ${lv} · ${ses.words} флагов · ${ses.fmode === "teams" ? "⚔️ 🔴 против 🔵" : "👤 каждый сам за себя"}`;
+    }
     if (ses.mode === "croc") return `🐊 Крокодил ведёт · ${catName(ses.cat)} · ${(LEVELS[ses.level] || LEVELS.medium).name} · ${ses.words} слов`;
     return (
       `${catName(ses.cat)} · ${(LEVELS[ses.level] || LEVELS.medium).name} · ${ses.words} слов · ` +
@@ -1949,7 +1972,8 @@ export class CrocodileGame extends DurableObject {
     const level = this.rowWinner(r.votes.level, r.def.level);
     const words = Number(this.rowWinner(r.votes.words, r.def.words)) || SESSION_WORDS;
     const time = Number(this.rowWinner(r.votes.time, r.def.time)) || 0;
-    this.session = { cat: catKey === "any" ? null : catKey, n: 0, p: {}, words, level, timed: time > 0, timeSec: time, mode };
+    const fpref = this.rowWinner(r.votes.fmode || {}, this.session?.fpref || "ffa");
+    this.session = { cat: catKey === "any" ? null : catKey, n: 0, p: {}, words, level, timed: time > 0, timeSec: time, mode, fpref };
     this.last = { level, timed: time > 0, timeSec: time || 300 };
     await this.ctx.storage.put({ session: this.session, last: this.last });
     await this.edit(r.chatId, r.msgId, (r.header ? r.header + "\n\n" : "") + "🗳 <b>Решено:</b> " + this.sessionSummary(this.session));
@@ -2228,17 +2252,61 @@ export class CrocodileGame extends DurableObject {
   }
 
   // ================== 🏳️ ФЛАГИ ==================
-  flagSessionReset() {
-    const ses = this.session;
-    Object.assign(ses, {
-      n: 0, p: {}, bank: 0, capital: flagBasePrice(ses.level), // капитал на 1 букву — только на первом флаге
-      answered: {}, guessedBy: {}, queue: [], used: [], silenceSkips: 0, paid: false,
-    });
+  // Три режима (выбираются сами по числу игроков):
+  //   solo  — 1 игрок: серия «сколько подряд без ошибки», в рейтинг не идёт, свои рекорды
+  //   ffa   — 2–3 игрока (или выбор при 4+): каждый сам за себя, буквы покупаются за свой рейтинг и видны только тебе
+  //   teams — 4+ игроков по выбору: 🔴 против 🔵, у каждой команды свой банк
+  flagModeFor(pref) {
+    const n = this.activePlayers().length;
+    if (n <= 1) return "solo";
+    if (n < FLAG_TEAMS_MIN) return "ffa";
+    return pref === "teams" ? "teams" : "ffa";
   }
 
-  flagFunds() {
-    const ses = this.session || {};
-    return (ses.bank || 0) + (ses.capital || 0);
+  flagSessionReset() {
+    const ses = this.session;
+    const fmode = this.flagModeFor(ses.fpref);
+    const players = this.activePlayers();
+    Object.assign(ses, {
+      n: 0, p: {}, fmode, answered: {}, guessedBy: {}, queue: [], used: [], silenceSkips: 0, paid: false,
+      streak: 0, soloId: fmode === "solo" ? players[0]?.id || this.game?.initiator || null : null,
+      soloName: fmode === "solo" ? players[0]?.name || null : null,
+      teams: null,
+    });
+    if (fmode === "teams") {
+      const sh = players.map((p) => p.id).sort(() => Math.random() - 0.5);
+      const cap = flagBasePrice(ses.level);
+      ses.teams = {
+        r: { members: sh.filter((_, i) => i % 2 === 0), bank: 0, capital: cap },
+        b: { members: sh.filter((_, i) => i % 2 === 1), bank: 0, capital: cap },
+      };
+    }
+  }
+
+  teamOf(uid) {
+    const t = this.session?.teams;
+    if (!t) return null;
+    if (t.r.members.includes(uid)) return "r";
+    if (t.b.members.includes(uid)) return "b";
+    return null;
+  }
+  // Опоздавший попадает в меньшую команду
+  joinTeam(uid) {
+    const t = this.session.teams;
+    let k = this.teamOf(uid);
+    if (k) return k;
+    k = t.r.members.length <= t.b.members.length ? "r" : "b";
+    t[k].members.push(uid);
+    return k;
+  }
+  teamFunds(k) {
+    const t = this.session.teams[k];
+    return (t.bank || 0) + (t.capital || 0);
+  }
+  teamNames(k) {
+    const roster = this.game?.roster || {};
+    const ses = this.session;
+    return this.session.teams[k].members.map((id) => esc(ses.answered[id] || roster[id]?.name || "игрок")).join(", ");
   }
 
   pickFlag() {
@@ -2254,7 +2322,10 @@ export class CrocodileGame extends DurableObject {
     const queued = new Set((ses.queue || []).map((q) => q.code));
     let cand = pool.filter((e) => !ses.used.includes(e.code) && !recent.has(e.code) && !queued.has(e.code));
     if (!cand.length) cand = pool.filter((e) => !ses.used.includes(e.code) && !queued.has(e.code));
-    if (!cand.length) cand = pool;
+    if (!cand.length) {
+      ses.used = []; // серия прошла все флаги уровня — начинаем круг заново
+      cand = pool;
+    }
     const e = cand[Math.floor(Math.random() * cand.length)];
     ses.used.push(e.code);
     this.recentFlags = [...(this.recentFlags || []), e.code].slice(-60);
@@ -2264,51 +2335,76 @@ export class CrocodileGame extends DurableObject {
   flagLetters(r) {
     return [...upper(r.name)].map((ch, i) => (/[А-ЯЁA-Z]/.test(ch) ? i : -1)).filter((i) => i >= 0);
   }
-  flagHidden(r) {
-    return this.flagLetters(r).filter((i) => !r.revealed.includes(i));
+  flagMaskOf(r, revealed) {
+    return [...upper(r.name)].map((ch, i) => (/[А-ЯЁA-Z]/.test(ch) ? (revealed.includes(i) ? ch : "_") : ch)).join(" ");
   }
-  flagMask(r) {
-    return [...upper(r.name)].map((ch, i) => (/[А-ЯЁA-Z]/.test(ch) ? (r.revealed.includes(i) ? ch : "_") : ch)).join(" ");
-  }
-  flagPrice(r) {
-    return flagBasePrice(r.level) + r.buys;
+  // чьи буквы: в ffa — игрока, в командах — команды
+  flagOwner(uid) {
+    return this.session.fmode === "teams" ? "t:" + this.joinTeam(uid) : "u:" + uid;
   }
   flagNeed() {
     return flagLetterNeed(Math.max(1, this.activePlayers().length));
   }
   flagUnlocks(r) {
     const need = this.flagNeed();
-    const letters = this.flagLetters(r).length;
-    return {
-      letter: r.silent || r.misses >= need,
-      skip: r.silent || r.misses >= need * 2 || r.revealed.length * 2 >= letters,
-      need,
-    };
+    return { letter: r.silent || r.misses >= need, skip: r.silent || r.misses >= need * 2, need };
   }
 
   flagCaption(r) {
     const ses = this.session;
     const u = this.flagUnlocks(r);
+    const lvl = (LEVELS[r.level] || LEVELS.medium).name;
+    let body = "";
+    if (ses.fmode === "solo") {
+      const best = r.best || 0;
+      body =
+        `🔥 Серия <b>${esc(ses.soloName || "")}</b>: <b>${ses.streak}</b> подряд · ${lvl}\n` +
+        `🏅 Твой рекорд: ${best}` + (r.groupRec ? ` · рекорд группы: ${r.groupRec.best} (${esc(r.groupRec.name)})` : "") +
+        "\nОдна ошибка — и серия заканчивается. Букв и пропусков нет.";
+    } else if (ses.fmode === "teams") {
+      body =
+        `📂 Флаги · ${ses.n + 1}/${ses.words} · ${lvl} · ⚔️ Команда на команду\n` +
+        `🔴 Банк: <b>${this.teamFunds("r")}</b> · 🔵 Банк: <b>${this.teamFunds("b")}</b>` +
+        (ses.n === 0 ? " (стартовый капитал — только на этот флаг)" : "") +
+        `\n🔴 ${this.teamNames("r")}\n🔵 ${this.teamNames("b")}` +
+        (u.letter ? `\n🔤 Буква за банк команды — её видят только игроки твоей команды («👁 Наши буквы»)` : `\n🔒 Буквы откроются после ${u.need} неправильных ответов`);
+    } else {
+      body =
+        `📂 Флаги · ${ses.n + 1}/${ses.words} · ${lvl} · 👤 Каждый сам за себя\n` +
+        `🎯 Кто первый — +${r.value} себе` +
+        (u.letter ? `\n🔤 Буква — за твой рейтинг (от ${flagBasePrice(r.level)}), видишь её только ты` : `\n🔒 Буквы откроются после ${u.need} неправильных ответов`);
+    }
     return (
       (r.header ? r.header + "\n\n" : "") +
       "🏳️ <b>Чей это флаг?</b>\n" +
-      `📂 Флаги · ${ses.n + 1}/${ses.words} · ${(LEVELS[r.level] || LEVELS.medium).name}\n` +
-      `💰 Банк: <b>${this.flagFunds()}</b>` + (ses.capital ? ` (из них ${ses.capital} — стартовый, только на этот флаг)` : "") +
-      (r.revealed.length ? `\n🔤 <code>${this.flagMask(r)}</code>` : "") +
-      (u.letter ? "" : `\n🔒 Подсказки откроются после ${u.need} неправильных ответов`) +
-      (r.silent ? "\n⏳ Тишина… подсказки открыты. Ещё 2 минуты — и флаг пропустится сам." : "")
+      body +
+      (r.silent && ses.fmode !== "solo" ? "\n⏳ Тишина… кнопки открыты. Ещё 2 минуты — и флаг пропустится сам." : "") +
+      (r.silent && ses.fmode === "solo" ? "\n⏳ Ты здесь? Ещё 2 минуты тишины — и серия закончится." : "")
     );
   }
 
+  skipNeed() {
+    const ses = this.session;
+    if (ses.fmode === "teams") return 2; // по одному из каждой команды
+    return this.activePlayers().length >= 3 ? 2 : 1;
+  }
+
   flagKeyboard(r) {
-    const u = this.flagUnlocks(r);
-    const need = this.activePlayers().length >= 3 ? 2 : 1;
-    const conf = (list) => (need > 1 && list.length ? ` · ${list.length}/${need}` : "");
+    const ses = this.session;
     const rows = [];
-    const btns = [];
-    if (u.letter && this.flagHidden(r).length) btns.push({ text: `🔤 Буква за ${this.flagPrice(r)}${conf(r.pend.buy)}`, callback_data: "fl:buy" });
-    if (u.skip) btns.push({ text: `⏭ Пропустить${conf(r.pend.skip)}`, callback_data: "fl:skip" });
-    if (btns.length) rows.push(btns);
+    if (ses.fmode === "solo") {
+      rows.push([{ text: "🏁 Закончить серию", callback_data: "fl:end" }]);
+    } else {
+      const u = this.flagUnlocks(r);
+      const need = this.skipNeed();
+      const btns = [];
+      if (u.letter) {
+        btns.push({ text: "🔤 Купить букву", callback_data: "fl:buy" });
+        btns.push({ text: ses.fmode === "teams" ? "👁 Наши буквы" : "👁 Мои буквы", callback_data: "fl:see" });
+      }
+      if (btns.length) rows.push(btns);
+      if (u.skip) rows.push([{ text: `⏭ Пропустить${need > 1 && r.pend.skip.length ? ` · ${r.pend.skip.length}/${need}` : ""}`, callback_data: "fl:skip" }]);
+    }
     if (r.rulesUrl) rows.push([{ text: "📖 Правила режима", url: r.rulesUrl }]);
     return { inline_keyboard: rows };
   }
@@ -2321,15 +2417,20 @@ export class CrocodileGame extends DurableObject {
 
   async openFlag(chatId, header = "", oldMsgId = null) {
     const ses = this.session;
-    if (ses.n > 0) ses.capital = 0; // стартовый капитал сгорает после первого флага
+    if (ses.n > 0 && ses.teams) ses.teams.r.capital = ses.teams.b.capital = 0; // стартовый капитал сгорает после первого флага
     const e = this.pickFlag();
     const now = Date.now();
     const r = {
       status: "flag", chatId, msgId: null, header, code: e.code, name: e.name, answers: e.answers,
       level: ses.level, value: FLAG_VALUE[ses.level] || 8, misses: 0, seen: [], lastGuess: {},
-      revealed: [], buys: 0, pend: { buy: [], skip: [] }, silent: false, lastAct: now, deadline: now + FLAG_UNLOCK_MS,
+      priv: {}, buys: {}, pend: { skip: [] }, silent: false, lastAct: now, deadline: now + FLAG_UNLOCK_MS,
       isPhoto: true, rulesUrl: null,
     };
+    if (ses.fmode === "solo") {
+      const rec = (await this.ctx.storage.get(`s:${ses.soloId}:${ses.level}`)) || {};
+      r.best = rec.best || 0;
+      r.groupRec = (await this.ctx.storage.get("srec:" + ses.level)) || null;
+    }
     if (ses.n === 0) {
       const me = await this.getMe();
       if (me.username) r.rulesUrl = `https://t.me/${me.username}?start=rules_flags`;
@@ -2341,8 +2442,7 @@ export class CrocodileGame extends DurableObject {
       chat_id: chatId, photo: flagImage(e.code), caption: this.flagCaption(r), parse_mode: "HTML", reply_markup: this.flagKeyboard(r),
     });
     if (!res.ok) {
-      // картинка не загрузилась — показываем флаг эмодзи
-      r.isPhoto = false;
+      r.isPhoto = false; // картинка не загрузилась — показываем флаг эмодзи
       res = await this.send(chatId, flagEmoji(e.code) + "\n\n" + this.flagCaption(r), { reply_markup: this.flagKeyboard(r) });
     }
     if (this.round !== r) return;
@@ -2368,32 +2468,64 @@ export class CrocodileGame extends DurableObject {
     const uid = msg.from.id;
     const name = displayName(msg.from);
     const now = Date.now();
+
+    // ---- серия одного игрока: чужие ответы не считаются, ошибка = назвал другую страну
+    if (ses.fmode === "solo") {
+      if (uid !== ses.soloId) return;
+      r.lastAct = now;
+      if (flagGuess(text, r)) {
+        r.status = "ended";
+        ses.streak++;
+        await this.tg("setMessageReaction", { chat_id: r.chatId, message_id: msg.message_id, reaction: [{ type: "emoji", emoji: "🔥" }] });
+        ses.n++;
+        await this.ctx.storage.put("session", ses);
+        return this.openFlag(r.chatId, `✅ <b>${upper(r.name)}</b>! Серия: <b>${ses.streak}</b> 🔥`, r.msgId);
+      }
+      if (!flagAliasMap().has(tokenize(text).join(" "))) {
+        await this.ctx.storage.put("round", r);
+        return this.ctx.storage.setAlarm(this.flagNextDue(r)); // не название страны — не ошибка
+      }
+      r.status = "ended";
+      return this.endSeries(r, `❌ Это не ${esc(text)} — это <b>${upper(r.name)}</b>.`);
+    }
+
     ses.answered[uid] = name;
+    if (ses.fmode === "teams") this.joinTeam(uid);
     r.lastAct = now;
     ses.silenceSkips = 0;
 
     if (flagGuess(text, r)) {
       r.status = "ended"; // до любого await — второй угадавший не получит
-      ses.bank = (ses.bank || 0) + r.value;
       const g = ses.guessedBy[uid] || { name, count: 0 };
       g.name = name;
       g.count++;
       ses.guessedBy[uid] = g;
-      await this.addStats(uid, name, { guessed: 1 });
+      let line;
+      if (ses.fmode === "teams") {
+        const k = this.teamOf(uid);
+        ses.teams[k].bank += r.value;
+        await this.addStats(uid, name, { guessed: 1 });
+        line = `🎉 <b>${esc(name)}</b> ${k === "r" ? "🔴" : "🔵"} угадал(а): <b>${upper(r.name)}</b>! +${r.value} в банк команды`;
+      } else {
+        const hard = (ses.level === "hard" || ses.level === "ultimate") && this.activePlayers().length >= 3;
+        await this.addStats(uid, name, { points: r.value, guessed: 1, ...(hard ? { hardPoints: r.value } : {}) });
+        await this.sessionPoints(uid, name, r.value);
+        line = `🎉 <b>${esc(name)}</b> угадал(а): <b>${upper(r.name)}</b>! +${r.value}`;
+      }
       await this.tg("setMessageReaction", { chat_id: r.chatId, message_id: msg.message_id, reaction: [{ type: "emoji", emoji: "🎉" }] });
-      return this.nextFlag(r.chatId, `🎉 <b>${esc(name)}</b> угадал(а): <b>${upper(r.name)}</b>! +${r.value} в банк 💰`, r.msgId);
+      return this.nextFlag(r.chatId, line, r.msgId);
     }
 
     // Промах: повторы и частые ответы одного игрока не считаются
     const key = tokenize(text).join(" ");
-    const before = JSON.stringify(this.flagKeyboard(r));
+    const before = JSON.stringify(this.flagKeyboard(r)) + this.flagCaption(r);
     if (key && !r.seen.includes(key) && now - (r.lastGuess[uid] || 0) >= 3000) {
       r.seen.push(key);
       r.lastGuess[uid] = now;
       r.misses++;
     }
     await this.ctx.storage.put({ round: r, session: ses });
-    if (JSON.stringify(this.flagKeyboard(r)) !== before) await this.editFlag(r); // открылись кнопки
+    if (JSON.stringify(this.flagKeyboard(r)) + this.flagCaption(r) !== before) await this.editFlag(r); // открылись кнопки / новый игрок в команде
     await this.ctx.storage.setAlarm(this.flagNextDue(r));
   }
 
@@ -2401,44 +2533,75 @@ export class CrocodileGame extends DurableObject {
     const r = this.round;
     const ses = this.session;
     const uid = cq.from.id;
-    const u = this.flagUnlocks(r);
-    const need = this.activePlayers().length >= 3 ? 2 : 1;
+    const name = displayName(cq.from);
 
-    if (data === "fl:buy") {
-      if (!u.letter) return this.answer(cq, "🔒 Подсказка ещё не открыта", true);
-      const hidden = this.flagHidden(r);
-      if (!hidden.length) return this.answer(cq, "Все буквы уже открыты");
-      const price = this.flagPrice(r);
-      if (this.flagFunds() < price) {
-        return this.answer(cq, `💰 В банке ${this.flagFunds()}, а буква стоит ${price}. Угадайте флаг, чтобы пополнить банк!`, true);
+    if (ses.fmode === "solo") {
+      if (data !== "fl:end") return this.answer(cq);
+      if (uid !== ses.soloId && !this.isOwner(uid) && !(await this.isAdmin(r.chatId, uid))) return this.answer(cq, "Это серия другого игрока", true);
+      if (r.status !== "flag") return this.answer(cq);
+      r.status = "ended";
+      await this.answer(cq, "🏁 Серия закончена");
+      return this.endSeries(r, `🏁 Серия закончена. Это была <b>${upper(r.name)}</b>.`);
+    }
+
+    const u = this.flagUnlocks(r);
+    if (data === "fl:see" || data === "fl:buy") {
+      if (!u.letter) return this.answer(cq, "🔒 Буквы ещё не открыты", true);
+      const owner = this.flagOwner(uid);
+      const mine = r.priv[owner] || [];
+      const total = this.flagLetters(r).length;
+      if (data === "fl:see") {
+        if (!mine.length) return this.answer(cq, `Букв пока нет. В названии ${total} букв.`, true);
+        return this.answer(cq, `🔤 ${this.flagMaskOf(r, mine)}`, true);
       }
-      if (!r.pend.buy.includes(uid)) r.pend.buy.push(uid);
-      if (r.pend.buy.length < need) {
-        await this.ctx.storage.put("round", r);
-        await this.answer(cq, `Голос за покупку учтён. Нужен ещё ${need - r.pend.buy.length} игрок`);
-        return this.editFlag(r);
+      const hidden = this.flagLetters(r).filter((i) => !mine.includes(i));
+      if (hidden.length <= 1) return this.answer(cq, `🔤 ${this.flagMaskOf(r, mine)}\nОсталась одна буква — угадывай сам(а)! 😉`, true);
+      const price = flagBasePrice(r.level) + (r.buys[owner] || 0);
+      if (ses.fmode === "teams") {
+        const k = owner.slice(2);
+        const t = ses.teams[k];
+        if (this.teamFunds(k) < price) return this.answer(cq, `💰 В банке команды ${this.teamFunds(k)}, а буква стоит ${price}. Угадайте флаг, чтобы пополнить банк!`, true);
+        const fromCap = Math.min(t.capital || 0, price);
+        t.capital -= fromCap;
+        t.bank = Math.max(0, t.bank - (price - fromCap));
+        ses.answered[uid] = name;
+      } else {
+        const s = (await this.ctx.storage.get("u:" + uid)) || {};
+        if ((s.points || 0) < price) return this.answer(cq, `💰 Буква стоит ${price} очков рейтинга, а у тебя ${s.points || 0}. Угадай флаг — и сможешь купить!`, true);
+        await this.addStats(uid, name, { points: -price });
+        await this.sessionPoints(uid, name, -price);
       }
-      const fromCap = Math.min(ses.capital || 0, price);
-      ses.capital = (ses.capital || 0) - fromCap;
-      ses.bank = (ses.bank || 0) - (price - fromCap);
-      r.buys++;
-      r.pend.buy = [];
-      r.revealed.push(hidden[Math.floor(Math.random() * hidden.length)]); // случайная буква
+      r.buys[owner] = (r.buys[owner] || 0) + 1;
+      mine.push(hidden[Math.floor(Math.random() * hidden.length)]); // случайная буква
+      r.priv[owner] = mine;
       r.lastAct = Date.now();
       await this.ctx.storage.put({ round: r, session: ses });
-      await this.answer(cq, `🔤 Буква открыта (−${price} из банка)`);
-      await this.editFlag(r);
+      await this.answer(cq, `🔤 ${this.flagMaskOf(r, mine)}\n(−${price}${ses.fmode === "teams" ? " из банка команды" : " рейтинга"} · видишь только ${ses.fmode === "teams" ? "твоя команда" : "ты"})`, true);
+      if (ses.fmode === "teams") await this.editFlag(r);
       return this.ctx.storage.setAlarm(this.flagNextDue(r));
     }
 
     if (data === "fl:skip") {
       if (!u.skip) return this.answer(cq, "🔒 Пропуск ещё недоступен", true);
-      if (!r.pend.skip.includes(uid)) r.pend.skip.push(uid);
-      if (r.pend.skip.length < need) {
-        await this.ctx.storage.put("round", r);
-        await this.answer(cq, `Голос за пропуск учтён. Нужен ещё ${need - r.pend.skip.length} игрок`);
-        return this.editFlag(r);
+      const need = this.skipNeed();
+      if (ses.fmode === "teams") {
+        const k = this.joinTeam(uid);
+        if (!r.pend.skip.some((x) => this.teamOf(x) === k)) r.pend.skip.push(uid);
+        const both = ["r", "b"].every((t) => r.pend.skip.some((x) => this.teamOf(x) === t));
+        if (!both) {
+          await this.ctx.storage.put({ round: r, session: ses });
+          await this.answer(cq, `Голос за пропуск учтён. Нужно согласие ${k === "r" ? "🔵 синих" : "🔴 красных"}`);
+          return this.editFlag(r);
+        }
+      } else {
+        if (!r.pend.skip.includes(uid)) r.pend.skip.push(uid);
+        if (r.pend.skip.length < need) {
+          await this.ctx.storage.put("round", r);
+          await this.answer(cq, `Голос за пропуск учтён. Нужен ещё ${need - r.pend.skip.length} игрок`);
+          return this.editFlag(r);
+        }
       }
+      if (r.status !== "flag") return this.answer(cq);
       r.status = "ended";
       ses.queue.push({ code: r.code, at: ses.n + FLAG_REQUEUE });
       await this.answer(cq, "⏭ Пропускаем");
@@ -2460,6 +2623,7 @@ export class CrocodileGame extends DurableObject {
     }
     if (r.silent && now >= this.flagNextDue(r) - 1000) {
       r.status = "ended";
+      if (ses.fmode === "solo") return this.endSeries(r, `😴 Тишина… серия закончена. Это была <b>${upper(r.name)}</b>.`);
       ses.silenceSkips = (ses.silenceSkips || 0) + 1;
       ses.queue.push({ code: r.code, at: ses.n + FLAG_REQUEUE });
       if (ses.silenceSkips >= 2) {
@@ -2474,7 +2638,6 @@ export class CrocodileGame extends DurableObject {
   async nextFlag(chatId, header, oldMsgId) {
     const ses = this.session;
     ses.n++;
-    ses.capital = 0;
     await this.ctx.storage.put("session", ses);
     if (ses.n >= ses.words) {
       if (oldMsgId) await this.removeButtons(chatId, oldMsgId);
@@ -2483,26 +2646,81 @@ export class CrocodileGame extends DurableObject {
     return this.openFlag(chatId, header, oldMsgId);
   }
 
-  // Банк делится поровну между теми, кто дал хотя бы один ответ
+  // ---- конец серии: личный рекорд и рекорд группы (в рейтинг не идёт)
+  async saveSeries() {
+    const ses = this.session;
+    if (!ses || ses.fmode !== "solo" || ses.paid) return "";
+    ses.paid = true;
+    await this.ctx.storage.put("session", ses);
+    const uid = ses.soloId;
+    const name = ses.soloName || "Игрок";
+    const lvl = ses.level;
+    const n = ses.streak || 0;
+    if (uid && !this.isArena) await this.indexUser(uid); // чтобы группа появилась в меню игрока
+    const key = `s:${uid}:${lvl}`;
+    const rec = (await this.ctx.storage.get(key)) || { name, best: 0, games: 0 };
+    const personal = n > rec.best;
+    rec.name = name;
+    rec.games = (rec.games || 0) + 1;
+    if (personal) rec.best = n;
+    await this.ctx.storage.put(key, rec);
+    const grec = (await this.ctx.storage.get("srec:" + lvl)) || null;
+    const groupBest = n > 0 && (!grec || n > grec.best);
+    if (groupBest) await this.ctx.storage.put("srec:" + lvl, { uid, name, best: n, at: Date.now() });
+    const lvlName = (LEVELS[lvl] || LEVELS.medium).name;
+    return (
+      `🔥 Серия: <b>${n}</b> ${lvlName}` +
+      (groupBest ? `\n\n🏆 <b>НОВЫЙ РЕКОРД ГРУППЫ!</b> ${esc(name)} — ${n} подряд (${lvlName})` + (grec ? ` (было ${grec.best}, ${esc(grec.name)})` : "") + "!"
+        : personal && n > 0 ? `\n🏅 Новый личный рекорд!` : `\n🏅 Твой рекорд: ${rec.best}` + (grec ? ` · рекорд группы: ${grec.best} (${esc(grec.name)})` : "")) +
+      "\n\n<i>Серия — тренировка: в рейтинг не идёт, зато рекорды видны всем в «🏆 Рейтинги».</i>"
+    );
+  }
+
+  async endSeries(r, header) {
+    const res = await this.saveSeries();
+    if (r.msgId) await this.removeButtons(r.chatId, r.msgId);
+    return this.showChoice(r.chatId, header + "\n\n🏁 <b>Серия окончена!</b>\n" + res);
+  }
+
+  // Итоги флагов (ffa и команды); для серии — рекорды
   async payoutFlags() {
     const ses = this.session;
     if (!ses || ses.cat !== FLAG_CAT || ses.paid) return "";
+    if (ses.fmode === "solo") return this.saveSeries();
     ses.paid = true;
-    const ids = Object.keys(ses.answered || {});
-    const bank = Math.max(0, ses.bank || 0);
-    const share = ids.length ? Math.floor(bank / ids.length) : 0;
-    const countsHard = (ses.level === "hard" || ses.level === "ultimate") && ids.length >= 3;
-    if (share > 0) {
-      for (const id of ids) await this.addStats(Number(id), ses.answered[id], { points: share, ...(countsHard ? { hardPoints: share } : {}) });
-      await this.report();
-    }
     await this.ctx.storage.put("session", ses);
     const guessed = Object.values(ses.guessedBy || {}).sort((a, b) => b.count - a.count);
+    const guessLine = guessed.length ? "🎯 Угадали: " + guessed.map((g) => `${esc(g.name)} — ${g.count}`).join(", ") : "🎯 Никто не угадал ни одного флага";
+
+    if (ses.fmode === "teams") {
+      const countsHard = (ses.level === "hard" || ses.level === "ultimate") && Object.keys(ses.answered).length >= 3;
+      const lines = [];
+      for (const k of ["r", "b"]) {
+        const t = ses.teams[k];
+        const bank = Math.max(0, t.bank || 0);
+        const ids = t.members.filter((id) => ses.answered[id]);
+        const share = ids.length ? Math.floor(bank / ids.length) : 0;
+        if (share > 0) {
+          for (const id of ids) {
+            await this.addStats(Number(id), ses.answered[id], { points: share, ...(countsHard ? { hardPoints: share } : {}) });
+            await this.sessionPoints(Number(id), ses.answered[id], share);
+          }
+        }
+        lines.push(`${k === "r" ? "🔴 Красные" : "🔵 Синие"}: банк <b>${bank}</b>` + (share ? ` → по ${share} (${ids.map((id) => esc(ses.answered[id])).join(", ")})` : ""));
+      }
+      await this.report();
+      const rb = ses.teams.r.bank, bb = ses.teams.b.bank;
+      const win = rb === bb ? "🤝 <b>Ничья!</b>" : rb > bb ? "🏆 Победили <b>🔴 Красные</b>!" : "🏆 Победили <b>🔵 Синие</b>!";
+      return win + "\n" + lines.join("\n") + "\n" + guessLine + (countsHard ? "\n🔥 Очки идут в зачёт Супер-игры" : "");
+    }
+
+    // каждый сам за себя: очки уже начислены по ходу
+    await this.report();
+    const top = Object.values(ses.p).sort((a, b) => b.points - a.points);
+    const medals = ["🥇", "🥈", "🥉"];
     return (
-      `💰 Банк команды: <b>${bank}</b>` +
-      (ids.length && share ? ` → по <b>${share}</b> каждому (${ids.map((id) => esc(ses.answered[id])).join(", ")})` : "") +
-      (guessed.length ? "\n🎯 Угадали: " + guessed.map((g) => `${esc(g.name)} — ${g.count}`).join(", ") : "\n🎯 Никто не угадал ни одного флага") +
-      (countsHard && share ? "\n🔥 Очки идут в зачёт Супер-игры" : "")
+      (top.length ? "📊 <b>Итоги:</b>\n" + top.slice(0, 8).map((e, i) => `${medals[i] || i + 1 + "."} ${esc(e.name)} — ${e.points}`).join("\n") : "Никто не набрал очков 🤷") +
+      "\n" + guessLine
     );
   }
 
@@ -2511,6 +2729,24 @@ export class CrocodileGame extends DurableObject {
     const pay = await this.payoutFlags();
     const text = (header ? header + "\n\n" : "") + `🏁 <b>Раунд окончен!</b> ${this.sessionSummary(ses)}\n` + pay;
     return this.showChoice(chatId, text);
+  }
+
+  // рекорды серий группы (для меню)
+  async seriesTop() {
+    const out = [];
+    for (const lv of Object.keys(LEVELS)) {
+      const rec = await this.ctx.storage.get("srec:" + lv);
+      if (rec) out.push(`${LEVELS[lv].name}: <b>${rec.best}</b> — ${esc(rec.name)}`);
+    }
+    return out.join("\n");
+  }
+  async seriesOf(uid) {
+    const out = {};
+    for (const lv of Object.keys(LEVELS)) {
+      const rec = await this.ctx.storage.get(`s:${uid}:${lv}`);
+      if (rec?.best) out[lv] = rec.best;
+    }
+    return Object.keys(out).length ? out : null;
   }
 
   // ---------- сбор игроков ----------
