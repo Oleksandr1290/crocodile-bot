@@ -6,6 +6,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { WORDS_BY_LEVEL } from "./words.js";
 import { CATEGORIES, CATEGORY_ORDER } from "./categories.js";
+import { FLAGS, FLAG_VALUE, flagImage } from "./flags.js";
 
 // ================== НАСТРОЙКИ ИГРЫ ==================
 const LEVELS = {
@@ -31,7 +32,15 @@ const LOBBY_MS = 15 * 1000;       // сбор игроков после /game
 const ROSTER_IDLE_MS = 10 * 60 * 1000; // кто 10 минут ничего не делал — выбывает из состава
 const CLASSIC_MIN = 2;            // классике нужно минимум 2 игрока
 const ANY_CAT = { name: "🎲 Любая" };
-const catName = (key) => (CATEGORIES[key] || ANY_CAT).name;
+const FLAG_CAT = "flags";
+const catName = (key) => (key === FLAG_CAT ? "🏳️ Флаги" : (CATEGORIES[key] || ANY_CAT).name);
+
+// ================== ФЛАГИ ==================
+const FLAG_UNLOCK_MS = 60 * 1000;      // минута тишины → подсказки и пропуск доступны
+const FLAG_AUTOSKIP_MS = 2 * 60 * 1000; // ещё 2 минуты тишины → флаг пропускается сам
+const FLAG_REQUEUE = 3;                // пропущенный флаг вернётся через столько флагов
+const flagLetterNeed = (players) => Math.min(8, 3 + Math.max(0, players - 2)); // промахов до покупки буквы
+const flagBasePrice = (level) => Math.max(1, Math.round((FLAG_VALUE[level] || 8) / 4));
 
 // ================== НАСТРОЙКИ СУПЕР-ИГРЫ ==================
 // Можно переопределить переменными в Cloudflare (Settings → Variables):
@@ -421,7 +430,7 @@ const RULES = {
       "4. Кто первым угадал — получает очки, ведущий тоже.\n\n" +
       "🔄 Слово можно сменить до 5 раз, 🏳 «Сдаюсь» — закончить слово.\n" +
       "⚠️ Ведущий написал загаданное слово — слово аннулируется, −3 очка.\n" +
-      "👥 Нужно минимум 2 игрока.",
+      "👥 Нужно минимум 2 игрока. Играешь один — выбирай 🏳️ Флаги.",
   },
   vote: {
     button: "🗳 Как начинается игра",
@@ -456,7 +465,23 @@ const RULES = {
       "👑 Победитель получает звание Чемпиона Арены, а его группа — титул.",
   },
 };
-const RULES_ORDER = ["vote", "classic", "points", "arena"];
+RULES.flags = {
+  button: "🏳️ Флаги и банк команды",
+  text:
+    "🏳️ <b>Флаги — играем командой</b>\n\n" +
+    "Ведущего нет: бот показывает флаг, все пишут название страны. Кто первым угадал — пополняет общий 💰 банк команды " +
+    "(🟢 4 · 🟡 8 · 🔴 12 · 💀 20 очков за флаг).\n\n" +
+    "<b>Подсказки за очки банка</b>\n" +
+    "🔤 Буква — открывает случайную букву (и длину названия). Стоит четверть ценности флага, каждая следующая на 1 дороже.\n" +
+    "Кнопка появляется после нескольких неправильных ответов (3 при 1–2 игроках, +1 за игрока, максимум 8) или минуты тишины.\n" +
+    "⏭ Пропустить — бесплатно, ответ не показывается, флаг вернётся позже.\n" +
+    "👥 Если играют 3+ человек, покупку и пропуск подтверждают двое.\n\n" +
+    "💡 В начале раунда в банке есть стартовый капитал на 1 букву — только на первый флаг.\n" +
+    "😴 2 минуты тишины после подсказок — флаг пропускается. Два таких подряд — игра останавливается.\n\n" +
+    "🏁 В конце раунда банк делится <b>поровну</b> между всеми, кто дал хотя бы один ответ, и идёт в рейтинг. " +
+    "На 🔴/💀 при 3+ игроках очки засчитываются и для Супер-игры 🔥.",
+};
+const RULES_ORDER = ["vote", "classic", "flags", "points", "arena"];
 
 async function screenRules(env, chatId, msgId, key) {
   const r = RULES[key];
@@ -584,6 +609,7 @@ export class CrocodileGame extends DurableObject {
       this.session = (await ctx.storage.get("session")) || null; // текущий раунд: { cat, n, p, words, level, timed, timeSec }
       this.game = (await ctx.storage.get("game")) || null;       // состав игры: { roster: {id: {name, at}}, initiator }
       this.last = (await ctx.storage.get("last")) || null;       // последние выбранные сложность и время
+      this.recentFlags = (await ctx.storage.get("recentFlags")) || [];
     });
   }
 
@@ -659,7 +685,7 @@ export class CrocodileGame extends DurableObject {
     return this.tg("editMessageReplyMarkup", { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [] } });
   }
   isActive() {
-    return ["waiting", "playing", "gather", "vote", "choice", "lobby"].includes(this.round.status);
+    return ["waiting", "playing", "gather", "vote", "choice", "lobby", "flag"].includes(this.round.status);
   }
   activeCount() {
     const now = Date.now();
@@ -1062,6 +1088,7 @@ export class CrocodileGame extends DurableObject {
     }
 
     if (msg.text.startsWith("/")) return this.onCommand(msg, anonAdmin);
+    if (this.round.status === "flag" && msg.from && !msg.from.is_bot) return this.onFlagText(msg);
     if (this.round.status === "playing" && !msg.from?.is_bot) {
       const before = this.round;
       await this.onPlayingText(msg);
@@ -1157,6 +1184,7 @@ export class CrocodileGame extends DurableObject {
     if (r.status === "playing") {
       return this.send(chatId, `🎤 Сейчас объясняет <b>${esc(r.leaderName)}</b> — угадывайте!`);
     }
+    if (r.status === "flag") return this.send(chatId, "🏳️ Сейчас угадываем флаги — пишите ответы!");
     if (r.status === "ended") return; // прямо сейчас подводятся итоги
 
     if (this.isArena) {
@@ -1408,6 +1436,7 @@ export class CrocodileGame extends DurableObject {
     if (r.status === "gather") return this.answer(cq);
     if (r.status === "vote") return this.onVote(cq, data);
     if (r.status === "choice") return this.onChoice(cq, data);
+    if (r.status === "flag") return this.onFlagButton(cq, data);
 
     switch (data) {
       case "lead": {
@@ -1657,14 +1686,10 @@ export class CrocodileGame extends DurableObject {
     if (r.status !== "lobby") return;
     r.status = "ended";
     const players = this.activePlayers();
-    if (players.length < CLASSIC_MIN) {
+    if (!players.length) {
       this.round = { status: "idle" };
       await this.save();
-      return this.edit(
-        r.chatId,
-        r.msgId,
-        `😔 Для игры нужно минимум ${CLASSIC_MIN} игрока, а записалось ${players.length}.\nПозовите друзей и начните снова — /game`
-      );
+      return this.edit(r.chatId, r.msgId, "😔 Никто не записался. Начать снова — /game");
     }
     await this.edit(r.chatId, r.msgId, `✅ <b>В игре ${players.length}:</b> ${players.map((p) => esc(p.name)).join(", ")}`);
     return this.startVote(r.chatId);
@@ -1703,9 +1728,9 @@ export class CrocodileGame extends DurableObject {
     };
     const head = (t) => [[t, "noop"]];
     const rows = [head("— 📂 Категория —")];
-    const cats = [...CATEGORY_ORDER, "any"];
+    const cats = r.solo ? [FLAG_CAT] : [...CATEGORY_ORDER, "any"];
     for (let i = 0; i < cats.length; i += 2) {
-      rows.push(cats.slice(i, i + 2).map((k) => [label("cat", k, catName(k), "any"), "vc:" + k]));
+      rows.push(cats.slice(i, i + 2).map((k) => [label("cat", k, catName(k), r.solo ? FLAG_CAT : "any"), "vc:" + k]));
     }
     rows.push(head("— 🎚 Сложность —"));
     const lv = Object.keys(LEVELS);
@@ -1726,6 +1751,7 @@ export class CrocodileGame extends DurableObject {
       `🗳 <b>Настройка раунда</b> · в игре ${players.length}\n` +
       `Голосуйте в каждой строке — до ${Math.round(VOTE_MS / 1000)} сек. Как только большинство определится с категорией, начнём.\n` +
       "✓ — что выбрано сейчас (если не голосовать, останется так)." +
+      (r.solo ? `\n\n👤 Ты один — доступны 🏳️ Флаги. Для остальных категорий нужно ${CLASSIC_MIN}+ игрока.` : "") +
       (voted.size ? `\n\n🙋 Проголосовали: ${voted.size} из ${Math.max(players.length, voted.size)}` : "")
     );
   }
@@ -1745,6 +1771,7 @@ export class CrocodileGame extends DurableObject {
     const r = {
       status: "vote", chatId, header, msgId: null, startedAt: now, deadline: now + VOTE_MS,
       votes: { cat: {}, level: {}, words: {}, time: {} }, def: this.voteDefaults(),
+      solo: this.activePlayers().length < CLASSIC_MIN,
     };
     this.round = r;
     await this.save();
@@ -1766,11 +1793,11 @@ export class CrocodileGame extends DurableObject {
     const map = { vc: "cat", vl: "level", vw: "words", vt: "time" };
     const key = map[row];
     const ok =
-      (key === "cat" && (val === "any" || CATEGORIES[val])) ||
+      (key === "cat" && (val === "any" || val === FLAG_CAT || CATEGORIES[val])) ||
       (key === "level" && LEVELS[val]) ||
       (key === "words" && WORD_OPTIONS.includes(Number(val))) ||
       (key === "time" && TIME_VOTE_OPTIONS.includes(Number(val)));
-    if (!ok) return this.answer(cq);
+    if (!ok || (key === "cat" && r.solo && val !== FLAG_CAT)) return this.answer(cq);
     const prev = r.votes[key][cq.from.id];
     r.votes[key][cq.from.id] = val;
     await this.save();
@@ -1783,6 +1810,7 @@ export class CrocodileGame extends DurableObject {
   }
 
   sessionSummary(ses) {
+    if (ses.cat === FLAG_CAT) return `${catName(FLAG_CAT)} · ${(LEVELS[ses.level] || LEVELS.medium).name} · ${ses.words} флагов`;
     return (
       `${catName(ses.cat)} · ${(LEVELS[ses.level] || LEVELS.medium).name} · ${ses.words} слов · ` +
       (ses.timed ? `⏱ ${fmtTime(ses.timeSec)}` : "♾ без времени")
@@ -1793,7 +1821,7 @@ export class CrocodileGame extends DurableObject {
     const r = this.round;
     if (r.status !== "vote") return;
     r.status = "ended";
-    const catKey = this.rowWinner(r.votes.cat, "any");
+    const catKey = this.rowWinner(r.votes.cat, r.solo ? FLAG_CAT : "any");
     const level = this.rowWinner(r.votes.level, r.def.level);
     const words = Number(this.rowWinner(r.votes.words, r.def.words)) || SESSION_WORDS;
     const time = Number(this.rowWinner(r.votes.time, r.def.time)) || 0;
@@ -1801,6 +1829,11 @@ export class CrocodileGame extends DurableObject {
     this.last = { level, timed: time > 0, timeSec: time || 300 };
     await this.ctx.storage.put({ session: this.session, last: this.last });
     await this.edit(r.chatId, r.msgId, (r.header ? r.header + "\n\n" : "") + "🗳 <b>Решено:</b> " + this.sessionSummary(this.session));
+    if (catKey === FLAG_CAT) {
+      this.flagSessionReset();
+      await this.ctx.storage.put("session", this.session);
+      return this.openFlag(r.chatId, `📂 <b>${this.sessionSummary(this.session)}</b>\nПоехали!`);
+    }
     return this.openRound(r.chatId, `📂 <b>${this.sessionSummary(this.session)}</b>\nПоехали!`);
   }
 
@@ -1831,6 +1864,11 @@ export class CrocodileGame extends DurableObject {
         ? "📊 <b>Итоги раунда:</b>\n" + top.slice(0, 5).map((e, i) => `${medals[i] || i + 1 + "."} ${esc(e.name)} — ${e.points}`).join("\n")
         : "Никто не набрал очков 🤷") +
       "\n\nЧто дальше?";
+    return this.showChoice(chatId, text, oldMsgId);
+  }
+
+  async showChoice(chatId, text, oldMsgId) {
+    if (!/Что дальше\?$/.test(text)) text += "\n\nЧто дальше?";
     const r = { status: "choice", chatId, text, msgId: null, deadline: Date.now() + WAIT_MS };
     this.round = r;
     await this.save();
@@ -1859,9 +1897,297 @@ export class CrocodileGame extends DurableObject {
       return this.startVote(r.chatId);
     }
     this.session = { ...(this.session || {}), n: 0, p: {} };
+    if (this.session.cat === FLAG_CAT) this.flagSessionReset();
     await this.ctx.storage.put("session", this.session);
     await this.answer(cq, "▶️ Продолжаем!");
+    if (this.session.cat === FLAG_CAT) return this.openFlag(r.chatId, `▶️ Продолжаем: <b>${this.sessionSummary(this.session)}</b>`);
     return this.openRound(r.chatId, `▶️ Продолжаем: <b>${this.sessionSummary(this.session)}</b>`);
+  }
+
+  // ================== 🏳️ ФЛАГИ ==================
+  flagSessionReset() {
+    const ses = this.session;
+    Object.assign(ses, {
+      n: 0, p: {}, bank: 0, capital: flagBasePrice(ses.level), // капитал на 1 букву — только на первом флаге
+      answered: {}, guessedBy: {}, queue: [], used: [], silenceSkips: 0, paid: false,
+    });
+  }
+
+  flagFunds() {
+    const ses = this.session || {};
+    return (ses.bank || 0) + (ses.capital || 0);
+  }
+
+  pickFlag() {
+    const ses = this.session;
+    const due = (ses.queue || []).findIndex((q) => q.at <= ses.n);
+    if (due >= 0) {
+      const code = ses.queue.splice(due, 1)[0].code;
+      const e = FLAG_LIST.find((x) => x.code === code);
+      if (e) return e;
+    }
+    const pool = FLAG_LIST.filter((e) => e.level === ses.level);
+    const recent = new Set(this.recentFlags || []);
+    const queued = new Set((ses.queue || []).map((q) => q.code));
+    let cand = pool.filter((e) => !ses.used.includes(e.code) && !recent.has(e.code) && !queued.has(e.code));
+    if (!cand.length) cand = pool.filter((e) => !ses.used.includes(e.code) && !queued.has(e.code));
+    if (!cand.length) cand = pool;
+    const e = cand[Math.floor(Math.random() * cand.length)];
+    ses.used.push(e.code);
+    this.recentFlags = [...(this.recentFlags || []), e.code].slice(-60);
+    return e;
+  }
+
+  flagLetters(r) {
+    return [...upper(r.name)].map((ch, i) => (/[А-ЯЁA-Z]/.test(ch) ? i : -1)).filter((i) => i >= 0);
+  }
+  flagHidden(r) {
+    return this.flagLetters(r).filter((i) => !r.revealed.includes(i));
+  }
+  flagMask(r) {
+    return [...upper(r.name)].map((ch, i) => (/[А-ЯЁA-Z]/.test(ch) ? (r.revealed.includes(i) ? ch : "_") : ch)).join(" ");
+  }
+  flagPrice(r) {
+    return flagBasePrice(r.level) + r.buys;
+  }
+  flagNeed() {
+    return flagLetterNeed(Math.max(1, this.activePlayers().length));
+  }
+  flagUnlocks(r) {
+    const need = this.flagNeed();
+    const letters = this.flagLetters(r).length;
+    return {
+      letter: r.silent || r.misses >= need,
+      skip: r.silent || r.misses >= need * 2 || r.revealed.length * 2 >= letters,
+      need,
+    };
+  }
+
+  flagCaption(r) {
+    const ses = this.session;
+    const u = this.flagUnlocks(r);
+    return (
+      (r.header ? r.header + "\n\n" : "") +
+      "🏳️ <b>Чей это флаг?</b>\n" +
+      `📂 Флаги · ${ses.n + 1}/${ses.words} · ${(LEVELS[r.level] || LEVELS.medium).name}\n` +
+      `💰 Банк: <b>${this.flagFunds()}</b>` + (ses.capital ? ` (из них ${ses.capital} — стартовый, только на этот флаг)` : "") +
+      (r.revealed.length ? `\n🔤 <code>${this.flagMask(r)}</code>` : "") +
+      (u.letter ? "" : `\n🔒 Подсказки откроются после ${u.need} неправильных ответов`) +
+      (r.silent ? "\n⏳ Тишина… подсказки открыты. Ещё 2 минуты — и флаг пропустится сам." : "")
+    );
+  }
+
+  flagKeyboard(r) {
+    const u = this.flagUnlocks(r);
+    const need = this.activePlayers().length >= 3 ? 2 : 1;
+    const conf = (list) => (need > 1 && list.length ? ` · ${list.length}/${need}` : "");
+    const rows = [];
+    const btns = [];
+    if (u.letter && this.flagHidden(r).length) btns.push({ text: `🔤 Буква за ${this.flagPrice(r)}${conf(r.pend.buy)}`, callback_data: "fl:buy" });
+    if (u.skip) btns.push({ text: `⏭ Пропустить${conf(r.pend.skip)}`, callback_data: "fl:skip" });
+    if (btns.length) rows.push(btns);
+    if (r.rulesUrl) rows.push([{ text: "📖 Правила режима", url: r.rulesUrl }]);
+    return { inline_keyboard: rows };
+  }
+
+  async editFlag(r) {
+    const base = { chat_id: r.chatId, message_id: r.msgId, parse_mode: "HTML", reply_markup: this.flagKeyboard(r) };
+    if (r.isPhoto) return this.tg("editMessageCaption", { ...base, caption: this.flagCaption(r) });
+    return this.tg("editMessageText", { ...base, text: flagEmoji(r.code) + "\n\n" + this.flagCaption(r) });
+  }
+
+  async openFlag(chatId, header = "", oldMsgId = null) {
+    const ses = this.session;
+    if (ses.n > 0) ses.capital = 0; // стартовый капитал сгорает после первого флага
+    const e = this.pickFlag();
+    const now = Date.now();
+    const r = {
+      status: "flag", chatId, msgId: null, header, code: e.code, name: e.name, answers: e.answers,
+      level: ses.level, value: FLAG_VALUE[ses.level] || 8, misses: 0, seen: [], lastGuess: {},
+      revealed: [], buys: 0, pend: { buy: [], skip: [] }, silent: false, lastAct: now, deadline: now + FLAG_UNLOCK_MS,
+      isPhoto: true, rulesUrl: null,
+    };
+    if (ses.n === 0) {
+      const me = await this.getMe();
+      if (me.username) r.rulesUrl = `https://t.me/${me.username}?start=rules_flags`;
+    }
+    this.round = r;
+    await this.ctx.storage.put({ round: r, session: ses, recentFlags: this.recentFlags || [] });
+    if (oldMsgId) await this.removeButtons(chatId, oldMsgId);
+    let res = await this.tg("sendPhoto", {
+      chat_id: chatId, photo: flagImage(e.code), caption: this.flagCaption(r), parse_mode: "HTML", reply_markup: this.flagKeyboard(r),
+    });
+    if (!res.ok) {
+      // картинка не загрузилась — показываем флаг эмодзи
+      r.isPhoto = false;
+      res = await this.send(chatId, flagEmoji(e.code) + "\n\n" + this.flagCaption(r), { reply_markup: this.flagKeyboard(r) });
+    }
+    if (this.round !== r) return;
+    if (!res.ok) {
+      this.round = { status: "idle" };
+      return this.save();
+    }
+    r.msgId = res.result.message_id;
+    await this.save();
+    await this.ctx.storage.setAlarm(r.deadline);
+  }
+
+  flagNextDue(r) {
+    if (!r.silent) return r.lastAct + FLAG_UNLOCK_MS;
+    return Math.max(r.lastAct, r.silentAt || 0) + FLAG_AUTOSKIP_MS;
+  }
+
+  async onFlagText(msg) {
+    const r = this.round;
+    const ses = this.session;
+    const text = msg.text.trim();
+    if (!text || text.split(/\s+/).length > 3) return; // болтовня — не ответ
+    const uid = msg.from.id;
+    const name = displayName(msg.from);
+    const now = Date.now();
+    ses.answered[uid] = name;
+    r.lastAct = now;
+    ses.silenceSkips = 0;
+
+    if (flagGuess(text, r)) {
+      r.status = "ended"; // до любого await — второй угадавший не получит
+      ses.bank = (ses.bank || 0) + r.value;
+      const g = ses.guessedBy[uid] || { name, count: 0 };
+      g.name = name;
+      g.count++;
+      ses.guessedBy[uid] = g;
+      await this.addStats(uid, name, { guessed: 1 });
+      await this.tg("setMessageReaction", { chat_id: r.chatId, message_id: msg.message_id, reaction: [{ type: "emoji", emoji: "🎉" }] });
+      return this.nextFlag(r.chatId, `🎉 <b>${esc(name)}</b> угадал(а): <b>${upper(r.name)}</b>! +${r.value} в банк 💰`, r.msgId);
+    }
+
+    // Промах: повторы и частые ответы одного игрока не считаются
+    const key = tokenize(text).join(" ");
+    const before = JSON.stringify(this.flagKeyboard(r));
+    if (key && !r.seen.includes(key) && now - (r.lastGuess[uid] || 0) >= 3000) {
+      r.seen.push(key);
+      r.lastGuess[uid] = now;
+      r.misses++;
+    }
+    await this.ctx.storage.put({ round: r, session: ses });
+    if (JSON.stringify(this.flagKeyboard(r)) !== before) await this.editFlag(r); // открылись кнопки
+    await this.ctx.storage.setAlarm(this.flagNextDue(r));
+  }
+
+  async onFlagButton(cq, data) {
+    const r = this.round;
+    const ses = this.session;
+    const uid = cq.from.id;
+    const u = this.flagUnlocks(r);
+    const need = this.activePlayers().length >= 3 ? 2 : 1;
+
+    if (data === "fl:buy") {
+      if (!u.letter) return this.answer(cq, "🔒 Подсказка ещё не открыта", true);
+      const hidden = this.flagHidden(r);
+      if (!hidden.length) return this.answer(cq, "Все буквы уже открыты");
+      const price = this.flagPrice(r);
+      if (this.flagFunds() < price) {
+        return this.answer(cq, `💰 В банке ${this.flagFunds()}, а буква стоит ${price}. Угадайте флаг, чтобы пополнить банк!`, true);
+      }
+      if (!r.pend.buy.includes(uid)) r.pend.buy.push(uid);
+      if (r.pend.buy.length < need) {
+        await this.ctx.storage.put("round", r);
+        await this.answer(cq, `Голос за покупку учтён. Нужен ещё ${need - r.pend.buy.length} игрок`);
+        return this.editFlag(r);
+      }
+      const fromCap = Math.min(ses.capital || 0, price);
+      ses.capital = (ses.capital || 0) - fromCap;
+      ses.bank = (ses.bank || 0) - (price - fromCap);
+      r.buys++;
+      r.pend.buy = [];
+      r.revealed.push(hidden[Math.floor(Math.random() * hidden.length)]); // случайная буква
+      r.lastAct = Date.now();
+      await this.ctx.storage.put({ round: r, session: ses });
+      await this.answer(cq, `🔤 Буква открыта (−${price} из банка)`);
+      await this.editFlag(r);
+      return this.ctx.storage.setAlarm(this.flagNextDue(r));
+    }
+
+    if (data === "fl:skip") {
+      if (!u.skip) return this.answer(cq, "🔒 Пропуск ещё недоступен", true);
+      if (!r.pend.skip.includes(uid)) r.pend.skip.push(uid);
+      if (r.pend.skip.length < need) {
+        await this.ctx.storage.put("round", r);
+        await this.answer(cq, `Голос за пропуск учтён. Нужен ещё ${need - r.pend.skip.length} игрок`);
+        return this.editFlag(r);
+      }
+      r.status = "ended";
+      ses.queue.push({ code: r.code, at: ses.n + FLAG_REQUEUE });
+      await this.answer(cq, "⏭ Пропускаем");
+      return this.nextFlag(r.chatId, "⏭ Флаг пропущен — он ещё вернётся!", r.msgId);
+    }
+    return this.answer(cq);
+  }
+
+  async flagAlarm() {
+    const r = this.round;
+    const ses = this.session;
+    const now = Date.now();
+    if (!r.silent && now - r.lastAct >= FLAG_UNLOCK_MS - 1000) {
+      r.silent = true;
+      r.silentAt = now;
+      await this.ctx.storage.put("round", r);
+      await this.editFlag(r);
+      return this.ctx.storage.setAlarm(this.flagNextDue(r));
+    }
+    if (r.silent && now >= this.flagNextDue(r) - 1000) {
+      r.status = "ended";
+      ses.silenceSkips = (ses.silenceSkips || 0) + 1;
+      ses.queue.push({ code: r.code, at: ses.n + FLAG_REQUEUE });
+      if (ses.silenceSkips >= 2) {
+        await this.removeButtons(r.chatId, r.msgId);
+        return this.endFlags(r.chatId, "😴 Два флага подряд без ответов — игра остановлена.");
+      }
+      return this.nextFlag(r.chatId, "⏭ Тишина… флаг пропущен, он ещё вернётся.", r.msgId);
+    }
+    return this.ctx.storage.setAlarm(this.flagNextDue(r));
+  }
+
+  async nextFlag(chatId, header, oldMsgId) {
+    const ses = this.session;
+    ses.n++;
+    ses.capital = 0;
+    await this.ctx.storage.put("session", ses);
+    if (ses.n >= ses.words) {
+      if (oldMsgId) await this.removeButtons(chatId, oldMsgId);
+      return this.endFlags(chatId, header);
+    }
+    return this.openFlag(chatId, header, oldMsgId);
+  }
+
+  // Банк делится поровну между теми, кто дал хотя бы один ответ
+  async payoutFlags() {
+    const ses = this.session;
+    if (!ses || ses.cat !== FLAG_CAT || ses.paid) return "";
+    ses.paid = true;
+    const ids = Object.keys(ses.answered || {});
+    const bank = Math.max(0, ses.bank || 0);
+    const share = ids.length ? Math.floor(bank / ids.length) : 0;
+    const countsHard = (ses.level === "hard" || ses.level === "ultimate") && ids.length >= 3;
+    if (share > 0) {
+      for (const id of ids) await this.addStats(Number(id), ses.answered[id], { points: share, ...(countsHard ? { hardPoints: share } : {}) });
+      await this.report();
+    }
+    await this.ctx.storage.put("session", ses);
+    const guessed = Object.values(ses.guessedBy || {}).sort((a, b) => b.count - a.count);
+    return (
+      `💰 Банк команды: <b>${bank}</b>` +
+      (ids.length && share ? ` → по <b>${share}</b> каждому (${ids.map((id) => esc(ses.answered[id])).join(", ")})` : "") +
+      (guessed.length ? "\n🎯 Угадали: " + guessed.map((g) => `${esc(g.name)} — ${g.count}`).join(", ") : "\n🎯 Никто не угадал ни одного флага") +
+      (countsHard && share ? "\n🔥 Очки идут в зачёт Супер-игры" : "")
+    );
+  }
+
+  async endFlags(chatId, header) {
+    const ses = this.session;
+    const pay = await this.payoutFlags();
+    const text = (header ? header + "\n\n" : "") + `🏁 <b>Раунд окончен!</b> ${this.sessionSummary(ses)}\n` + pay;
+    return this.showChoice(chatId, text);
   }
 
   // ---------- сбор игроков ----------
@@ -2272,7 +2598,7 @@ export class CrocodileGame extends DurableObject {
   async cmdStop(msg, anonAdmin) {
     const chatId = msg.chat.id;
     const st = this.round.status;
-    if (!["waiting", "playing", "setup", "gather", "vote", "choice", "lobby"].includes(st)) {
+    if (!["waiting", "playing", "setup", "gather", "vote", "choice", "lobby", "flag"].includes(st)) {
       return this.send(chatId, "Сейчас нет активной игры. Начать — /game");
     }
 
@@ -2283,12 +2609,14 @@ export class CrocodileGame extends DurableObject {
     if (!allowed) return this.send(chatId, "🛑 Остановить игру может ведущий или админ группы.");
 
     const cur = this.round;
-    if (!["waiting", "playing", "setup", "gather", "vote", "choice", "lobby"].includes(cur.status)) return; // пока проверяли права, всё уже закончилось
+    if (!["waiting", "playing", "setup", "gather", "vote", "choice", "lobby", "flag"].includes(cur.status)) return; // пока проверяли права, всё уже закончилось
     const word = cur.status === "playing" ? cur.word : null;
+    const flagPay = cur.status === "flag" ? await this.payoutFlags() : "";
     this.round = { status: "idle" };
     await this.save();
     await this.ctx.storage.deleteAlarm();
     await this.removeButtons(chatId, cur.msgId);
+    if (flagPay) await this.send(chatId, "🛑 Игра во флаги остановлена.\n\n" + flagPay);
     const top = await this.topLines(5, this.isArena ? "m:" : "u:");
     return this.send(
       chatId,
@@ -2310,6 +2638,7 @@ export class CrocodileGame extends DurableObject {
       if (Date.now() >= r.deadline - 1000) return this.finishLobby();
       return this.ctx.storage.setAlarm(r.deadline);
     }
+    if (r.status === "flag") return this.flagAlarm();
     if (!["waiting", "playing", "setup", "gather", "vote", "choice"].includes(r.status)) return;
     if (Date.now() < r.deadline - 1000) {
       await this.ctx.storage.setAlarm(r.deadline);
@@ -2963,6 +3292,50 @@ function hasProfanity(t) {
 
 function hasLink(t) {
   return /(https?:\/\/|www\.|t\.me\/|telegram\.(me|dog)\/|\b[a-z0-9-]+\.(ru|com|net|org|io|me|xyz|top|site|online|shop|info|biz|club|link|ly)\b)/i.test(String(t));
+}
+
+// ---------- флаги: список и строгая проверка названий стран ----------
+const FLAG_LIST = Object.entries(FLAGS).flatMap(([level, list]) =>
+  list.map((s) => {
+    const [code, ...names] = s.split("|");
+    return { code, name: names[0], answers: names, level };
+  })
+);
+let FLAG_ALIAS = null; // "нормализованное название" → код страны
+function flagAliasMap() {
+  if (!FLAG_ALIAS) {
+    FLAG_ALIAS = new Map();
+    for (const e of FLAG_LIST) for (const a of e.answers) FLAG_ALIAS.set(tokenize(a).join(" "), e.code);
+  }
+  return FLAG_ALIAS;
+}
+
+// Правильно, если назвали эту страну; если точно назвали ДРУГУЮ страну — промах (Нигер ≠ Нигерия, Ирак ≠ Иран)
+function flagGuess(text, entry) {
+  const map = flagAliasMap();
+  const toks = tokenize(text);
+  const hits = new Set();
+  for (let i = 0; i < toks.length; ) {
+    let found = 0;
+    for (let len = Math.min(5, toks.length - i); len >= 1; len--) {
+      const code = map.get(toks.slice(i, i + len).join(" "));
+      if (code) {
+        hits.add(code);
+        found = len;
+        break;
+      }
+    }
+    i += found || 1;
+  }
+  if (hits.has(entry.code)) return true;
+  if (hits.size) return false;
+  // падежи и опечатки — только для своей страны и только для длинных названий
+  const fuzzy = entry.answers.filter((a) => tokenize(a).every((t) => t.length >= 5));
+  return answerHit(text, fuzzy);
+}
+
+function flagEmoji(code) {
+  return String.fromCodePoint(...code.toUpperCase().split("").map((c) => 0x1f1e6 + c.charCodeAt(0) - 65));
 }
 
 // ---------- проверка угадывания ----------
