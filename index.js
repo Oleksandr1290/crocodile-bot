@@ -1802,8 +1802,12 @@ export class CrocodileGame extends DurableObject {
     const solo = this.activePlayers().length < CLASSIC_MIN;
     return {
       level: c.level || "medium", words: String(SESSION_WORDS), time: String(c.timed ? c.timeSec : 0),
-      mode: solo ? "croc" : this.session?.mode || "classic",
+      mode: solo ? "croc" : "classic", // по умолчанию объясняют игроки; Крокодил — только если за него проголосуют
     };
+  }
+  // «Один ли игрок» считается заново при каждом показе: кто-то мог присоединиться во время настройки
+  voteSolo() {
+    return this.activePlayers().length < CLASSIC_MIN;
   }
 
   rowTally(votes) {
@@ -1839,7 +1843,7 @@ export class CrocodileGame extends DurableObject {
     }
     rows.push(head("— 👤 Кто объясняет —"));
     rows.push(
-      (r.solo ? ["croc"] : ["classic", "croc"]).map((m) => [label("mode", m, m === "croc" ? "🐊 Крокодил" : "🙋 Игроки", r.def.mode), "vm:" + m])
+      (this.voteSolo() ? ["croc"] : ["classic", "croc"]).map((m) => [label("mode", m, m === "croc" ? "🐊 Крокодил" : "🙋 Игроки", this.voteSolo() ? "croc" : "classic"), "vm:" + m])
     );
     if (this.activePlayers().length >= FLAG_TEAMS_MIN) {
       rows.push(head("— 🏳️ Если флаги —"));
@@ -1869,7 +1873,7 @@ export class CrocodileGame extends DurableObject {
       "Голосуйте в каждой строке — не спешите, времени сколько угодно.\n" +
       (r.initiator ? `Когда все готовы — <b>${esc(r.initiatorName || "запустивший игру")}</b> жмёт «▶️ Начать игру».\n` : "Когда все готовы — жмите «▶️ Начать игру».\n") +
       "✓ — что выбрано сейчас (если не голосовать, останется так)." +
-      (r.solo ? `\n\n👤 Ты один — объяснять будет 🐊 Крокодил (или выбирай 🏳️ Флаги — серия на рекорд). Чтобы объясняли игроки, нужно ${CLASSIC_MIN}+ человека.` : "") +
+      (this.voteSolo() ? `\n\n👤 Ты один — объяснять будет 🐊 Крокодил (или выбирай 🏳️ Флаги — серия на рекорд). Чтобы объясняли игроки, нужно ${CLASSIC_MIN}+ человека.` : "") +
       (voted.size ? `\n\n🙋 Проголосовали: ${voted.size} из ${Math.max(players.length, voted.size)}` : "")
     );
   }
@@ -1917,7 +1921,7 @@ export class CrocodileGame extends DurableObject {
       (key === "level" && LEVELS[val]) ||
       (key === "words" && WORD_OPTIONS.includes(Number(val))) ||
       (key === "time" && TIME_VOTE_OPTIONS.includes(Number(val))) ||
-      (key === "mode" && (val === "croc" || (val === "classic" && !r.solo))) ||
+      (key === "mode" && (val === "croc" || (val === "classic" && !this.voteSolo()))) ||
       (key === "fmode" && (val === "ffa" || val === "teams"));
     if (key === "fmode" && !r.votes.fmode) r.votes.fmode = {};
     if (!ok) return this.answer(cq);
@@ -1968,7 +1972,7 @@ export class CrocodileGame extends DurableObject {
     if (r.status !== "vote") return;
     r.status = "ended";
     const catKey = this.rowWinner(r.votes.cat, "any");
-    const mode = r.solo ? "croc" : this.rowWinner(r.votes.mode || {}, r.def.mode || "classic");
+    const mode = this.voteSolo() ? "croc" : this.rowWinner(r.votes.mode || {}, "classic");
     const level = this.rowWinner(r.votes.level, r.def.level);
     const words = Number(this.rowWinner(r.votes.words, r.def.words)) || SESSION_WORDS;
     const time = Number(this.rowWinner(r.votes.time, r.def.time)) || 0;
