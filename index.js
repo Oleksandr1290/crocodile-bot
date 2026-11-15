@@ -267,6 +267,8 @@ async function runTick(env) {
 }
 
 async function handlePrivate(env, msg) {
+  if (msg.chat_shared) return handleGroupPicked(env, msg);
+  if (msg.text === PICK_CANCEL_BTN) return handleGroupPicked(env, msg);
   if (!msg.text) {
     // фото, видео, GIF — нужны только когда бот ждёт рекламу
     await handlePrivateState(env, msg);
@@ -310,6 +312,7 @@ async function handlePrivate(env, msg) {
   if (payload === "arena") return screenArena(env, msg.chat.id, msg.from, null);
   if (payload.startsWith("top_")) return screenGroupTop(env, msg.chat.id, msg.from, payload.slice(4), null);
   if (payload === "catalog") return sendCatalog(env, msg.chat.id, 0, null);
+  if (payload === "partner") return screenPartner(env, msg.chat.id, null, msg.from);
   if (payload === "rules") return screenRules(env, msg.chat.id, null, null);
   if (payload.startsWith("rules_")) return screenRules(env, msg.chat.id, null, payload.slice(6));
   return screenMain(env, msg.chat.id, msg.from, null);
@@ -342,9 +345,10 @@ async function screenMain(env, chatId, user, msgId) {
     [{ text: "🏟 Супер-игра", callback_data: "arena" }, { text: "📖 Правила", callback_data: "rules" }],
   ];
   if (username) rows.push([{ text: "➕ Добавить бота в свою группу", url: `https://t.me/${username}?startgroup=true` }]);
-  rows.push([{ text: "📢 Реклама", callback_data: "adv" }]);
+  rows.push([{ text: "📢 Реклама", callback_data: "adv" }, { text: "🤝 Владельцам групп", callback_data: "pt" }]);
   if (isOwnerId(env, user.id)) {
     rows.push([{ text: "🎛 Пульт Арены", callback_data: "ap:status" }, { text: "📈 Статистика бота", callback_data: "st" }]);
+    rows.push([{ text: "🤝 Партнёры и выплаты", callback_data: "pp" }]);
   }
   return showScreen(
     env,
@@ -662,7 +666,13 @@ async function handlePrivateCallback(env, cq) {
     if (isOwnerId(env, user.id)) return screenAdsAdmin(env, chatId, msgId);
     return screenAdvertiser(env, chatId, msgId);
   }
-  if (data.startsWith("avn:")) return ack().then(() => advertiserChose(env, chatId, msgId, user, Number(data.slice(4)) || 0));
+  if (/^(avs|avt|ava):/.test(data) || data === "avn" || data === "avq" || data.startsWith("avc:")) return handleAdvertiserCallback(env, cq, data);
+  if (data === "pt" || data.startsWith("pt:")) return handlePartnerCallback(env, cq, data);
+  if (data.startsWith("pa:")) return handleApproveCallback(env, cq, data);
+  if (data === "pp" || data.startsWith("pp:")) {
+    if (!isOwnerId(env, user.id)) return ack("Только для владельца");
+    return handlePartnersAdminCallback(env, cq, data);
+  }
   if (data === "st" || data.startsWith("st:") || data === "advp" || data.startsWith("am:")) {
     if (!isOwnerId(env, user.id)) return ack("Только для владельца");
     if (data === "advp") return ack().then(() => screenAdvertiser(env, chatId, msgId, true));
@@ -755,6 +765,7 @@ function pct(now, before) {
 }
 function sourceName(s) {
   if (!s) return "напрямую";
+  if (s === "partner" || s.startsWith("partner_")) return "партнёрская программа";
   if (s === "me" || s === "arena" || s === "catalog" || s.startsWith("top_") || s.startsWith("rules")) return "из групп (кнопки бота)";
   return s;
 }
@@ -905,6 +916,7 @@ async function buildReport(env, kind) {
     registry(env, "days_sum", { days: daysBetween(env, from, now) }),
     registry(env, "days_sum", { days: daysBetween(env, prevFrom, prevTo) }),
   ]);
+  const { partners } = await registry(env, "partners_list", {});
   return (
     title +
     "\n\n" +
@@ -915,12 +927,15 @@ async function buildReport(env, kind) {
     `🏠 Групп подключено: <b>${gs.total}</b> (новых: ${gs.added}, удалили бота: ${gs.removed})\n` +
     `🔥 Активны за ${kind === "month" ? "месяц" : "неделю"}: ${gs.active} · участников во всех группах: ${gs.members}\n` +
     `🎮 Запусков игры: <b>${days.games || 0}</b>${pct(days.games || 0, prevDays.games || 0)}\n` +
-    `📢 Показов рекламы: ${days.imps || 0}\n` +
-    `📨 Заявок на рекламу: ${days.reqs || 0}`
+    `📢 Засчитано показов рекламы: ${days.imps || 0} · начислено партнёрам: ${num(days.earn || 0)} $\n` +
+    `📨 Заявок на рекламу: ${days.reqs || 0}\n` +
+    `🤝 Партнёров: ${partners.filter((p) => p.status === "active").length} · ждут проверки: ${partners.filter((p) => p.status === "pending").length}\n` +
+    `💸 К выплате партнёрам: <b>${num(partners.reduce((s, p) => s + (p.pending || 0), 0))} $</b>`
   );
 }
 
 async function maybeReports(env, tick) {
+  await registry(env, "housekeeping", {}).catch((e) => console.log("housekeeping", String(e)));
   if (!env.OWNER_ID || tick.hour !== REPORT_HOUR) return;
   if (tick.dow === 0) {
     const once = await registry(env, "once", { key: "rw:" + tick.day });
@@ -948,38 +963,552 @@ async function ownerUsername(env) {
   return res.result?.username || "";
 }
 
-// ---------- кнопка «Реклама» для рекламодателей ----------
-async function screenAdvertiser(env, chatId, msgId, isOwnerPreview = false) {
-  const gs = await registry(env, "groups_overview", { from: localMidnight(env, 6) });
-  const days = await registry(env, "days_sum", { days: daysBetween(env, localMidnight(env, 6), Date.now()) });
-  const html =
-    "📢 <b>Реклама в Крокодиле</b>\n\n" +
-    `🏠 Бот подключён к <b>${gs.total}</b> группам, в них <b>${gs.members}</b> участников.\n` +
-    `🔥 Активных групп за неделю: ${gs.active}\n` +
-    `🎮 Игр запущено за неделю: ${days.games || 0}\n\n` +
-    "<b>Как показывается реклама</b>\n" +
-    "Никаких внезапных рассылок. Когда участник группы запускает игру командой /game, " +
-    "бот показывает вашу рекламу прямо над сбором игроков — её видят все, кто собирается играть.\n" +
-    "Формат: текст, фото, видео или GIF, со ссылками.\n\n" +
-    "👇 <b>В скольких группах показать рекламу?</b>";
-  const opts = [5, 10, 20, 50].filter((n) => n < gs.total);
+// ---------- деньги, справедливая цена, курс гривны ----------
+// Справедливая цена за 1 показ = участники × reach (сколько примерно увидят) × cpm ($ за 1000 просмотров) / 1000
+// Владелец не может поставить цену выше рекомендуемой × maxMult.
+const AD_DEFAULTS = { reach: 0.15, cpm: 3, maxMult: 2, commission: 0, nextCommission: null, nextFrom: null };
+const COUNT_GAP_MS = 30 * 60 * 1000;       // в одной группе засчитывается не больше 1 показа за 30 минут
+const SAME_STARTER_MS = 2 * 60 * 60 * 1000; // один и тот же запустивший — не чаще раза в 2 часа
+const APPROVE_MS = 24 * 60 * 60 * 1000;    // сколько ждём одобрения рекламы от владельца группы
+const COMMISSION_NOTICE_DAYS = 14;         // за сколько дней предупреждаем о комиссии
+const SHOW_OPTIONS = [10, 25, 50, 100, 200];
+const PARTNER_TERMS =
+  "📋 <b>Условия</b>\n" +
+  "• Реклама появляется только когда кто-то запускает игру командой /game — никаких рассылок.\n" +
+  "• Каждую рекламу вы сначала видите сами и нажимаете «Одобрить» или «Отказать». Без вашего одобрения она не покажется.\n" +
+  "• Запрещено: казино и ставки, 18+, сомнительная крипта и «быстрые заработки», политика.\n" +
+  "• Оплата за каждый засчитанный показ. Показ засчитывается, если в игру записались минимум 2 игрока, и не чаще раза в 30 минут.\n" +
+  "• Выплаты — когда реклама откручена полностью или раз в неделю. Реквизиты для выплаты вы отправляете владельцу бота лично.\n" +
+  "• Выйти из программы можно в любой момент.";
+
+async function adCfg(env) {
+  const c = (await registry(env, "kv_get", { key: "adcfg" })).value || {};
+  return { ...AD_DEFAULTS, ...c };
+}
+function commissionNow(cfg, now = Date.now()) {
+  return cfg.nextFrom && now >= cfg.nextFrom ? cfg.nextCommission || 0 : cfg.commission || 0;
+}
+async function uahRate(env) {
+  const c = (await registry(env, "kv_get", { key: "uah" })).value;
+  if (c && Date.now() - c.at < 12 * 3600 * 1000) return c.rate;
+  try {
+    const res = await fetch("https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode=USD&json");
+    const rate = Number((await res.json())?.[0]?.rate);
+    if (rate > 0) {
+      await registry(env, "kv_put", { key: "uah", value: { rate, at: Date.now() } });
+      return rate;
+    }
+  } catch {}
+  return c?.rate || 41.5;
+}
+function num(x, d = 2) {
+  return (Math.round(x * 10 ** d) / 10 ** d).toFixed(d).replace(/\.?0+$/, "") || "0";
+}
+function money(usd, rate) {
+  const u = Number(usd) || 0;
+  const uah = u * rate;
+  return `${num(u, u < 1 ? 3 : 2)} $ (≈ ${num(uah, uah < 100 ? 1 : 0)} грн)`;
+}
+function fairPrice(members, cfg) {
+  const rec = Math.max(0.01, Math.round(((members || 0) * cfg.reach * cfg.cpm) / 1000 * 100) / 100);
+  return { rec, max: Math.round(rec * cfg.maxMult * 100) / 100 };
+}
+async function isCreator(env, chatId, uid) {
+  const res = await tg(env, "getChatMember", { chat_id: chatId, user_id: uid });
+  return res.result?.status === "creator";
+}
+async function groupInfo(env, chatId) {
+  const chat = await tg(env, "getChat", { chat_id: chatId });
+  const cnt = await tg(env, "getChatMemberCount", { chat_id: chatId });
+  return { title: chat.result?.title || "Группа", username: chat.result?.username || "", members: cnt.result || 0 };
+}
+const P_STATUS = { pending: "⏳ на проверке", active: "✅ партнёр", rejected: "❌ отказано", left: "🚪 вышли" };
+const PL_STATUS = { await: "⏳ ждёт одобрения", approved: "✅ идёт", rejected: "❌ отказ", expired: "⌛ нет ответа", done: "✔️ выполнено", stopped: "⏸ остановлено" };
+
+// ================== ВЛАДЕЛЬЦАМ ГРУПП ==================
+async function screenPartner(env, chatId, msgId, user) {
+  const [{ partners }, rate, cfg] = await Promise.all([registry(env, "partners_of", { uid: user.id }), uahRate(env), adCfg(env)]);
+  const com = commissionNow(cfg);
+  let html =
+    "🤝 <b>Владельцам групп</b>\n\n" +
+    "Зарабатывайте на своей группе: бот показывает рекламу только когда участники запускают игру, " +
+    "и только ту, которую вы сами одобрили.\n\n" +
+    (com ? `💼 Комиссия бота сейчас: ${com}% от суммы.\n` : "💼 Сейчас бот <b>не берёт комиссию</b> — вся сумма ваша.\n") +
+    (cfg.nextFrom && cfg.nextFrom > Date.now() ? `⚠️ С ${fmtDate(env, cfg.nextFrom)} комиссия будет ${cfg.nextCommission}%.\n` : "");
   const rows = [];
-  if (opts.length) rows.push(opts.map((n) => ({ text: String(n), callback_data: "avn:" + n })));
-  rows.push([{ text: `Во всех (${gs.total})`, callback_data: "avn:" + gs.total }]);
-  rows.push(isOwnerPreview ? [{ text: "⬅️ Управление рекламой", callback_data: "adv" }] : BACK);
+  if (partners.length) {
+    html += "\n<b>Ваши группы:</b>\n";
+    for (const p of partners) {
+      html +=
+        `\n<b>${esc(p.title)}</b> — ${P_STATUS[p.status] || p.status}\n` +
+        `   цена за показ: ${money(p.price, rate)}\n` +
+        `   показов: ${p.shows || 0} · заработано: ${num(p.earned || 0)} $ · к выплате: <b>${num(p.pending || 0)} $</b> · выплачено: ${num(p.paid || 0)} $\n`;
+      rows.push([{ text: `⚙️ ${String(p.title).slice(0, 30)}`, callback_data: "pt:g:" + p.chatId }]);
+    }
+  }
+  rows.push([{ text: "➕ Подключить группу", callback_data: "pt:add" }]);
+  rows.push([{ text: "📋 Условия", callback_data: "pt:terms" }, ...BACK]);
   return showScreen(env, chatId, msgId, html, rows);
 }
 
-async function advertiserChose(env, chatId, msgId, user, n) {
-  await setState(env, user.id, { kind: "req", groups: n });
+const PICK_GROUP_BTN = "📋 Выбрать мою группу";
+const PICK_CANCEL_BTN = "✖️ Отмена";
+// Системная кнопка Telegram «выбрать чат»: показывает только группы, которые человек создал и где уже есть бот.
+// Всё происходит в личке — в группе никто ничего не видит.
+async function screenPartnerAdd(env, chatId, msgId, user) {
+  const me = await tg(env, "getMe", {});
+  await showScreen(
+    env,
+    chatId,
+    msgId,
+    "➕ <b>Подключить группу</b>\n\n" +
+      `Нажмите кнопку <b>«${PICK_GROUP_BTN}»</b> внизу экрана. Telegram покажет только группы, ` +
+      "которые <b>вы создали</b> и где уже есть бот. Выбор видите только вы — в группе ничего не появится.\n\n" +
+      "Нет нужной группы в списке? Сначала добавьте в неё бота кнопкой ниже, потом выберите снова.",
+    [
+      [{ text: "➕ Добавить бота в группу", url: `https://t.me/${me.result?.username}?startgroup=true` }],
+      [{ text: "⬅️ Назад", callback_data: "pt" }],
+    ]
+  );
+  return tg(env, "sendMessage", {
+    chat_id: chatId,
+    text: "👇 Выберите группу:",
+    reply_markup: {
+      keyboard: [
+        [{ text: PICK_GROUP_BTN, request_chat: { request_id: 1, chat_is_channel: false, chat_is_created: true, bot_is_member: true, request_title: true } }],
+        [{ text: PICK_CANCEL_BTN }],
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: true,
+    },
+  });
+}
+
+// Человек выбрал группу системной кнопкой (или нажал «Отмена»)
+async function handleGroupPicked(env, msg) {
+  const hide = { remove_keyboard: true };
+  if (msg.text === PICK_CANCEL_BTN) {
+    await tg(env, "sendMessage", { chat_id: msg.chat.id, text: "Отменено.", reply_markup: hide });
+    return screenPartner(env, msg.chat.id, null, msg.from);
+  }
+  const gid = msg.chat_shared.chat_id;
+  await tg(env, "sendMessage", { chat_id: msg.chat.id, text: "✅ Группа выбрана, проверяю…", reply_markup: hide });
+  const bot = await tg(env, "getMe", {});
+  const inGroup = await tg(env, "getChatMember", { chat_id: gid, user_id: bot.result?.id });
+  if (!["member", "administrator", "creator"].includes(inGroup.result?.status)) {
+    return showScreen(env, msg.chat.id, null, "⚠️ Бота нет в этой группе. Добавьте его в группу и выберите её снова.", [
+      [{ text: "➕ Добавить бота в группу", url: `https://t.me/${bot.result?.username}?startgroup=true` }],
+      [{ text: "⬅️ Назад", callback_data: "pt" }],
+    ]);
+  }
+  return screenPartnerTerms(env, msg.chat.id, null, msg.from, String(gid));
+}
+
+async function screenPartnerTerms(env, chatId, msgId, user, gid) {
+  if (!(await isCreator(env, gid, user.id))) {
+    return showScreen(env, chatId, msgId, "⛔ Подключить группу может только её <b>создатель</b>.", [[{ text: "⬅️ Назад", callback_data: "pt" }]]);
+  }
+  const [info, cfg, rate] = await Promise.all([groupInfo(env, gid), adCfg(env), uahRate(env)]);
+  const fp = fairPrice(info.members, cfg);
   return showScreen(
     env,
     chatId,
     msgId,
-    `📢 Показ в <b>${n}</b> группах.\n\n✍️ Теперь <b>кратко расскажите, о чём реклама</b>: что продвигаете и для кого. ` +
-      "Напишите ответ одним сообщением сюда, в чат.",
-    [[{ text: "✖️ Отмена", callback_data: "adv" }]]
+    `🤝 <b>Группа «${esc(info.title)}»</b> · 👥 ${info.members}\n\n` +
+      PARTNER_TERMS +
+      "\n\n💼 <b>Комиссия:</b> сейчас бот её не берёт — вся сумма ваша. В будущем бот может удерживать процент за найденных вам рекламодателей. " +
+      `Об этом мы предупредим заранее, минимум за ${COMMISSION_NOTICE_DAYS} дней, и вы сможете выйти из программы.\n\n` +
+      `💲 Ориентир для вашей группы: <b>${money(fp.rec, rate)}</b> за показ.`,
+    [[{ text: "✅ Соглашаюсь", callback_data: "pt:ok:" + gid }], [{ text: "✖️ Отмена", callback_data: "pt" }]]
   );
+}
+
+async function screenPartnerPrice(env, chatId, msgId, user, gid) {
+  if (!(await isCreator(env, gid, user.id))) return screenPartnerTerms(env, chatId, msgId, user, gid);
+  const [info, cfg, rate] = await Promise.all([groupInfo(env, gid), adCfg(env), uahRate(env)]);
+  const fp = fairPrice(info.members, cfg);
+  return showScreen(
+    env,
+    chatId,
+    msgId,
+    `💲 <b>Цена за 1 показ рекламы — «${esc(info.title)}»</b>\n\n` +
+      `В группе ${info.members} участников. Сообщение со сбором игроков видят примерно ${Math.round(cfg.reach * 100)}% из них ` +
+      `— около ${Math.round(info.members * cfg.reach)} человек.\n` +
+      `Рынок рекламы в Telegram для развлекательных групп — около ${cfg.cpm} $ за 1000 просмотров.\n\n` +
+      `✅ Рекомендуемая цена: <b>${money(fp.rec, rate)}</b>\n` +
+      `⬆️ Максимум для вашей группы: <b>${money(fp.max, rate)}</b>\n\n` +
+      "Можно взять рекомендуемую или написать свою (не выше максимума). Максимум растёт вместе с группой.",
+    [
+      [{ text: `✅ Рекомендуемая — ${num(fp.rec, 3)} $`, callback_data: `pt:p:${gid}:${Math.round(fp.rec * 1000)}` }],
+      [{ text: "✍️ Написать свою цену", callback_data: "pt:own:" + gid }],
+      [{ text: "✖️ Отмена", callback_data: "pt" }],
+    ]
+  );
+}
+
+async function partnerSubmit(env, chatId, msgId, user, gid, price) {
+  if (!(await isCreator(env, gid, user.id))) return screenPartnerTerms(env, chatId, msgId, user, gid);
+  const [info, cfg, rate] = await Promise.all([groupInfo(env, gid), adCfg(env), uahRate(env)]);
+  const fp = fairPrice(info.members, cfg);
+  if (!(price > 0) || price > fp.max + 1e-9) {
+    return showScreen(env, chatId, msgId, `⚠️ Цена должна быть больше 0 и не выше ${money(fp.max, rate)}.`, [
+      [{ text: "⬅️ К выбору цены", callback_data: "pt:ok:" + gid }],
+    ]);
+  }
+  const res = await registry(env, "partner_apply", {
+    p: { chatId: gid, title: info.title, username: info.username, members: info.members, ownerId: user.id, ownerName: displayName(user), ownerUsername: user.username || "", price },
+  });
+  if (res.priceChanged) {
+    if (env.OWNER_ID) {
+      await tg(env, "sendMessage", { chat_id: env.OWNER_ID, parse_mode: "HTML", text: `💲 «${esc(info.title)}» сменила цену за показ: ${money(price, rate)}` });
+    }
+    return showScreen(env, chatId, msgId, `✅ Новая цена сохранена: <b>${money(price, rate)}</b>. Она действует для новых рекламных заказов.`, [
+      [{ text: "⬅️ Владельцам групп", callback_data: "pt" }],
+    ]);
+  }
+  if (env.OWNER_ID) {
+    const ug = info.username ? `https://t.me/${info.username}` : "";
+    await tg(env, "sendMessage", {
+      chat_id: env.OWNER_ID,
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+      text:
+        "🤝 <b>Заявка на партнёрство</b>\n\n" +
+        `Группа: <b>${esc(info.title)}</b>${ug ? ` (${ug})` : ""}\n` +
+        `👥 Участников: ${info.members}\n` +
+        `Владелец: <a href="tg://user?id=${user.id}">${esc(displayName(user))}</a>${user.username ? " @" + esc(user.username) : ""}\n` +
+        `💲 Цена за показ: ${money(price, rate)} (ориентир ${num(fp.rec, 3)} $, максимум ${num(fp.max, 3)} $)\n` +
+        `🎮 Активность: ${res.games7 || 0} игр за неделю`,
+      reply_markup: { inline_keyboard: [[{ text: "✅ Принять", callback_data: "pp:y:" + gid }, { text: "❌ Отказать", callback_data: "pp:n:" + gid }]] },
+    });
+  }
+  return showScreen(
+    env,
+    chatId,
+    msgId,
+    `📨 <b>Заявка отправлена!</b>\n\nГруппа «${esc(info.title)}», цена за показ: ${money(price, rate)}.\n` +
+      "Как только владелец бота её проверит, вам придёт сообщение. После этого рекламодатели увидят вашу группу.",
+    [[{ text: "⬅️ Владельцам групп", callback_data: "pt" }]]
+  );
+}
+
+async function screenPartnerGroup(env, chatId, msgId, user, gid) {
+  const p = (await registry(env, "kv_get", { key: "partner:" + gid })).value;
+  if (!p || String(p.ownerId) !== String(user.id)) return screenPartner(env, chatId, msgId, user);
+  const rate = await uahRate(env);
+  const rows = [];
+  if (p.status === "active" || p.status === "pending") rows.push([{ text: "💲 Изменить цену", callback_data: "pt:ok:" + gid }]);
+  if (p.status === "active" || p.status === "pending") rows.push([{ text: "🚪 Выйти из программы", callback_data: "pt:leave:" + gid }]);
+  if (p.status === "left" || p.status === "rejected") rows.push([{ text: "🔄 Подать заявку снова", callback_data: "pt:t:" + gid }]);
+  rows.push([{ text: "⬅️ Назад", callback_data: "pt" }]);
+  return showScreen(
+    env,
+    chatId,
+    msgId,
+    `⚙️ <b>${esc(p.title)}</b> — ${P_STATUS[p.status] || p.status}\n\n` +
+      `💲 Цена за показ: ${money(p.price, rate)}\n` +
+      `📢 Засчитано показов: ${p.shows || 0}\n` +
+      `💰 Заработано всего: ${money(p.earned || 0, rate)}\n` +
+      `⏳ К выплате: <b>${money(p.pending || 0, rate)}</b>\n` +
+      `✅ Выплачено: ${money(p.paid || 0, rate)}\n\n` +
+      "<i>Для выплаты напишите владельцу бота, куда перевести деньги.</i>",
+    rows
+  );
+}
+
+async function handlePartnerCallback(env, cq, data) {
+  const chatId = cq.message.chat.id;
+  const msgId = cq.message.message_id;
+  const user = cq.from;
+  const ack = (t = "", alert = false) => tg(env, "answerCallbackQuery", { callback_query_id: cq.id, text: t, show_alert: alert });
+  const [, act, gid, arg] = data.split(":");
+  if (data === "pt") return ack().then(() => screenPartner(env, chatId, msgId, user));
+  if (act === "terms") return ack().then(() => showScreen(env, chatId, msgId, PARTNER_TERMS, [[{ text: "⬅️ Назад", callback_data: "pt" }]]));
+  if (act === "add") return ack().then(() => screenPartnerAdd(env, chatId, msgId, user));
+  if (act === "t") return ack().then(() => screenPartnerTerms(env, chatId, msgId, user, gid));
+  if (act === "ok") return ack().then(() => screenPartnerPrice(env, chatId, msgId, user, gid));
+  if (act === "p") return ack().then(() => partnerSubmit(env, chatId, msgId, user, gid, Number(arg) / 1000));
+  if (act === "own") {
+    await ack();
+    await setState(env, user.id, { kind: "price", chatId: gid });
+    return showScreen(env, chatId, msgId, "✍️ Напишите цену за 1 показ одним сообщением.\nНапример: <code>0.4</code> (в долларах) или <code>15 грн</code>.", [
+      [{ text: "✖️ Отмена", callback_data: "pt" }],
+    ]);
+  }
+  if (act === "g") return ack().then(() => screenPartnerGroup(env, chatId, msgId, user, gid));
+  if (act === "leave") {
+    await ack();
+    return showScreen(env, chatId, msgId, "🚪 Точно выйти из программы? Реклама в группе сразу перестанет показываться. Заработанное останется к выплате.", [
+      [{ text: "Да, выйти", callback_data: "pt:bye:" + gid }, { text: "Нет", callback_data: "pt:g:" + gid }],
+    ]);
+  }
+  if (act === "bye") {
+    const res = await registry(env, "partner_leave", { chatId: gid, uid: user.id });
+    await ack(res.ok ? "Вы вышли из программы" : "Не получилось");
+    if (res.ok && env.OWNER_ID) await tg(env, "sendMessage", { chat_id: env.OWNER_ID, parse_mode: "HTML", text: `🚪 Группа «${esc(res.title)}» вышла из партнёрской программы.` });
+    return screenPartner(env, chatId, msgId, user);
+  }
+  // одобрение рекламы владельцем группы: pa:y:<ad>:<chat> / pa:n:<ad>:<chat>:<причина>
+  return ack();
+}
+
+async function handleApproveCallback(env, cq, data) {
+  const [, yn, adId, gid, why] = data.split(":");
+  const reason = { t: "не подходит тематика", s: "не нравится подача", o: "другая причина" }[why] || "";
+  const res = await registry(env, "placement_decide", { adId, chatId: gid, uid: cq.from.id, ok: yn === "y", reason });
+  await tg(env, "answerCallbackQuery", { callback_query_id: cq.id, text: res.text || "", show_alert: !res.ok });
+  if (!res.ok) return;
+  await tg(env, "editMessageReplyMarkup", { chat_id: cq.message.chat.id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } });
+  await tg(env, "sendMessage", {
+    chat_id: cq.message.chat.id,
+    text: yn === "y" ? "✅ Вы одобрили рекламу — она начнёт показываться после /game в вашей группе." : "❌ Вы отказались от этой рекламы. Она не будет показываться в вашей группе.",
+  });
+  if (env.OWNER_ID) {
+    await tg(env, "sendMessage", {
+      chat_id: env.OWNER_ID,
+      parse_mode: "HTML",
+      text: `${yn === "y" ? "✅" : "❌"} «${esc(res.title)}» ${yn === "y" ? "одобрила" : "отказала"} рекламу №${adId}${reason ? " — " + reason : ""}.`,
+    });
+  }
+}
+
+// ---------- владелец бота: партнёры, выплаты, комиссия ----------
+async function screenPartnersAdmin(env, chatId, msgId) {
+  const [{ partners }, rate] = await Promise.all([registry(env, "partners_list", {}), uahRate(env)]);
+  const pending = partners.filter((p) => p.status === "pending");
+  const active = partners.filter((p) => p.status === "active");
+  let html = `🤝 <b>Партнёры</b>\n\nАктивных: ${active.length} · на проверке: ${pending.length}\n`;
+  const rows = [];
+  for (const p of pending.slice(0, 6)) {
+    html += `\n⏳ <b>${esc(p.title)}</b> · 👥${p.members} · ${money(p.price, rate)} за показ`;
+    rows.push([
+      { text: `✅ ${String(p.title).slice(0, 18)}`, callback_data: "pp:y:" + p.chatId },
+      { text: "❌ Отказать", callback_data: "pp:n:" + p.chatId },
+    ]);
+  }
+  if (active.length) {
+    html += "\n\n<b>Активные:</b>";
+    for (const p of active.slice(0, 25)) {
+      html += `\n• ${esc(p.title)} · 👥${p.members} · ${num(p.price, 3)} $/показ · к выплате ${num(p.pending || 0)} $`;
+    }
+  }
+  const owed = partners.reduce((s, p) => s + (p.pending || 0), 0);
+  rows.push([{ text: `💸 Выплаты (${num(owed)} $)`, callback_data: "pp:pay" }, { text: "⚙️ Комиссия", callback_data: "pp:com" }]);
+  rows.push(BACK);
+  return showScreen(env, chatId, msgId, html, rows);
+}
+
+async function screenPayouts(env, chatId, msgId) {
+  const [{ partners }, rate] = await Promise.all([registry(env, "partners_list", {}), uahRate(env)]);
+  const due = partners.filter((p) => (p.pending || 0) > 0.0049).sort((a, b) => b.pending - a.pending);
+  const html =
+    "💸 <b>Выплаты партнёрам</b>\n\n" +
+    (due
+      .map(
+        (p) =>
+          `<b>${esc(p.title)}</b> — ${money(p.pending, rate)}\n` +
+          `   <a href="tg://user?id=${p.ownerId}">${esc(p.ownerName || "владелец")}</a>${p.ownerUsername ? " @" + esc(p.ownerUsername) : ""} · всего выплачено ${num(p.paid || 0)} $`
+      )
+      .join("\n\n") || "Сейчас никому ничего не должны 👍") +
+    "\n\nПереведи деньги владельцу и нажми «Выплачено» — бот запишет и сообщит ему.";
+  const rows = due.slice(0, 15).map((p) => [{ text: `✅ Выплачено: ${String(p.title).slice(0, 20)} — ${num(p.pending)} $`, callback_data: "pp:paid:" + p.chatId }]);
+  rows.push([{ text: "⬅️ Партнёры", callback_data: "pp" }]);
+  return showScreen(env, chatId, msgId, html, rows);
+}
+
+async function screenCommission(env, chatId, msgId) {
+  const cfg = await adCfg(env);
+  const now = commissionNow(cfg);
+  const html =
+    "⚙️ <b>Комиссия бота</b>\n\n" +
+    `Сейчас: <b>${now}%</b> — удерживается из заработка владельцев групп.\n` +
+    (cfg.nextFrom && cfg.nextFrom > Date.now() ? `Запланировано: ${cfg.nextCommission}% с ${fmtDate(env, cfg.nextFrom)}.\n` : "") +
+    `\nПовышение начнёт действовать через ${COMMISSION_NOTICE_DAYS} дней, а всем партнёрам сразу придёт предупреждение. ` +
+    "Снижение действует сразу.";
+  return showScreen(env, chatId, msgId, html, [
+    [0, 10, 15, 20, 30].map((n) => ({ text: (n === now ? "• " : "") + n + "%", callback_data: "pp:c:" + n })),
+    [{ text: "⬅️ Партнёры", callback_data: "pp" }],
+  ]);
+}
+
+async function setCommission(env, n) {
+  const cfg = await adCfg(env);
+  const cur = commissionNow(cfg);
+  const saved = (await registry(env, "kv_get", { key: "adcfg" })).value || {};
+  let notice;
+  if (n > cur) {
+    const from = Date.now() + COMMISSION_NOTICE_DAYS * 86400000;
+    Object.assign(saved, { commission: cur, nextCommission: n, nextFrom: from });
+    notice =
+      `⚠️ <b>Изменение условий</b>\n\nС ${fmtDate(env, from)} бот будет удерживать <b>${n}%</b> от суммы за показы рекламы — ` +
+      "это оплата за поиск рекламодателей для вашей группы. До этой даты всё по-прежнему.\n\n" +
+      "Если вы не согласны, выйти из программы можно в меню бота → «🤝 Владельцам групп».";
+  } else {
+    Object.assign(saved, { commission: n, nextCommission: null, nextFrom: null });
+    notice = n === cur ? null : `✅ <b>Хорошие новости:</b> комиссия бота теперь ${n}%.`;
+  }
+  await registry(env, "kv_put", { key: "adcfg", value: saved });
+  if (notice) {
+    const { partners } = await registry(env, "partners_list", {});
+    for (const p of partners.filter((x) => x.status === "active" || x.status === "pending")) {
+      await tg(env, "sendMessage", { chat_id: p.ownerId, parse_mode: "HTML", text: notice }).catch(() => {});
+    }
+  }
+}
+
+async function handlePartnersAdminCallback(env, cq, data) {
+  const chatId = cq.message.chat.id;
+  const msgId = cq.message.message_id;
+  const ack = (t = "", alert = false) => tg(env, "answerCallbackQuery", { callback_query_id: cq.id, text: t, show_alert: alert });
+  const [, act, gid] = data.split(":");
+  if (data === "pp") return ack().then(() => screenPartnersAdmin(env, chatId, msgId));
+  if (act === "y" || act === "n") {
+    const res = await registry(env, "partner_decide", { chatId: gid, ok: act === "y" });
+    await ack(res.ok ? (act === "y" ? "Принято" : "Отказано") : "Заявка уже обработана");
+    if (res.ok) {
+      await tg(env, "sendMessage", {
+        chat_id: res.ownerId,
+        parse_mode: "HTML",
+        text:
+          act === "y"
+            ? `🎉 <b>Группа «${esc(res.title)}» принята в партнёры!</b>\n\nТеперь рекламодатели видят вашу группу. Каждую рекламу вы получите сюда на одобрение.`
+            : `😔 Заявка группы «${esc(res.title)}» на партнёрство отклонена. Можно написать владельцу бота, чтобы узнать причину.`,
+      });
+    }
+    if (cq.message.text?.startsWith("🤝 Заявка")) return tg(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: msgId, reply_markup: { inline_keyboard: [] } });
+    return screenPartnersAdmin(env, chatId, msgId);
+  }
+  if (act === "pay") return ack().then(() => screenPayouts(env, chatId, msgId));
+  if (act === "paid") {
+    const res = await registry(env, "partner_paid", { chatId: gid });
+    await ack(res.amount ? `Записано: ${num(res.amount)} $` : "Нечего выплачивать");
+    if (res.amount) {
+      const rate = await uahRate(env);
+      await tg(env, "sendMessage", {
+        chat_id: res.ownerId,
+        parse_mode: "HTML",
+        text: `💸 <b>Выплата за рекламу в «${esc(res.title)}»:</b> ${money(res.amount, rate)}\nСпасибо, что вы с нами!`,
+      });
+    }
+    return screenPayouts(env, chatId, msgId);
+  }
+  if (act === "com") return ack().then(() => screenCommission(env, chatId, msgId));
+  if (act === "c") {
+    await setCommission(env, Number(gid) || 0);
+    await ack("Сохранено");
+    return screenCommission(env, chatId, msgId);
+  }
+  return ack();
+}
+
+// ================== РЕКЛАМОДАТЕЛЯМ ==================
+async function screenAdvertiser(env, chatId, msgId, isOwnerPreview = false) {
+  const [{ partners }, rate] = await Promise.all([registry(env, "partners_list", {}), uahRate(env)]);
+  const active = partners.filter((p) => p.status === "active");
+  const members = active.reduce((s, p) => s + (p.members || 0), 0);
+  const html =
+    "📢 <b>Реклама в Крокодиле</b>\n\n" +
+    `🏠 Групп-партнёров: <b>${active.length}</b>, в них <b>${members}</b> участников.\n\n` +
+    "<b>Как показывается реклама</b>\n" +
+    "Никаких внезапных рассылок. Когда участник группы запускает игру командой /game, " +
+    "бот показывает вашу рекламу прямо над сбором игроков — её видят все, кто собирается играть.\n" +
+    "Формат: текст, фото, видео или GIF, со ссылками.\n\n" +
+    "<b>Оплата за показ.</b> Показ засчитывается, только если в игру записались минимум 2 человека, и не чаще раза в 30 минут в одной группе — " +
+    "вы платите за живую аудиторию, а не за накрутку.\n" +
+    (active.length ? `Цена за показ в группах: от ${money(Math.min(...active.map((p) => p.price)), rate)}.` : "\nПока групп-партнёров нет — оставьте заявку, мы свяжемся с вами.");
+  const rows = active.length ? [[{ text: "📋 Выбрать группы", callback_data: "avs:0" }]] : [[{ text: "✍️ Оставить заявку", callback_data: "avq" }]];
+  rows.push(isOwnerPreview ? [{ text: "⬅️ Управление рекламой", callback_data: "adv" }] : BACK);
+  return showScreen(env, chatId, msgId, html, rows);
+}
+
+async function screenAdvSelect(env, chatId, msgId, st, page, rate) {
+  const { partners } = await registry(env, "partners_list", {});
+  const active = partners.filter((p) => p.status === "active").sort((a, b) => (b.members || 0) - (a.members || 0));
+  const pages = Math.max(1, Math.ceil(active.length / ADS_GROUPS_PAGE));
+  page = Math.min(Math.max(0, page), pages - 1);
+  const sel = new Set((st.groups || []).map(String));
+  const rows = active.slice(page * ADS_GROUPS_PAGE, (page + 1) * ADS_GROUPS_PAGE).map((p) => [
+    { text: `${sel.has(String(p.chatId)) ? "✅" : "⬜️"} ${String(p.title).slice(0, 22)} · 👥${p.members} · ${num(p.price, 3)}$`, callback_data: `avt:${p.chatId}:${page}` },
+  ]);
+  if (pages > 1) {
+    const nav = [];
+    if (page > 0) nav.push({ text: "◀️", callback_data: "avs:" + (page - 1) });
+    nav.push({ text: `${page + 1} / ${pages}`, callback_data: "noop" });
+    if (page < pages - 1) nav.push({ text: "▶️", callback_data: "avs:" + (page + 1) });
+    rows.push(nav);
+  }
+  rows.push([{ text: "🌍 Выбрать все", callback_data: "ava:" + page }]);
+  rows.push([{ text: `➡️ Дальше (${sel.size} выбрано)`, callback_data: "avn" }]);
+  rows.push([{ text: "⬅️ Назад", callback_data: "adv" }]);
+  return showScreen(
+    env,
+    chatId,
+    msgId,
+    "📋 <b>Выберите группы</b>\n\nВ списке: название, участники и цена за 1 показ в долларах.\n" + `Курс: 1 $ ≈ ${num(rate, 2)} грн.`,
+    rows
+  );
+}
+
+async function handleAdvertiserCallback(env, cq, data) {
+  const chatId = cq.message.chat.id;
+  const msgId = cq.message.message_id;
+  const user = cq.from;
+  const ack = (t = "", alert = false) => tg(env, "answerCallbackQuery", { callback_query_id: cq.id, text: t, show_alert: alert });
+  const rate = await uahRate(env);
+  if (data === "avq") {
+    await ack();
+    await setState(env, user.id, { kind: "req", groups: [], shows: 0, total: 0 });
+    return showScreen(env, chatId, msgId, "✍️ Кратко расскажите, о чём реклама и какой у вас бюджет. Напишите ответ одним сообщением.", [
+      [{ text: "✖️ Отмена", callback_data: "adv" }],
+    ]);
+  }
+  let st = (await getState(env, user.id)) || { kind: "advsel", groups: [] };
+  if (st.kind !== "advsel") st = { kind: "advsel", groups: [] };
+  if (data.startsWith("avs:")) {
+    await setState(env, user.id, st);
+    return ack().then(() => screenAdvSelect(env, chatId, msgId, st, Number(data.slice(4)) || 0, rate));
+  }
+  if (data.startsWith("avt:") || data.startsWith("ava:")) {
+    if (data.startsWith("ava:")) {
+      const { partners } = await registry(env, "partners_list", {});
+      st.groups = partners.filter((p) => p.status === "active").map((p) => String(p.chatId));
+    } else {
+      const [, gid] = data.split(":");
+      const set = new Set(st.groups.map(String));
+      set.has(gid) ? set.delete(gid) : set.add(gid);
+      st.groups = [...set];
+    }
+    await setState(env, user.id, st);
+    await ack();
+    return screenAdvSelect(env, chatId, msgId, st, Number(data.split(":").pop()) || 0, rate);
+  }
+  if (data === "avn") {
+    if (!st.groups.length) return ack("Выберите хотя бы одну группу", true);
+    await ack();
+    return showScreen(env, chatId, msgId, `📢 Групп выбрано: <b>${st.groups.length}</b>\n\n<b>Сколько показов купить в каждой группе?</b>`, [
+      SHOW_OPTIONS.map((n) => ({ text: String(n), callback_data: "avc:" + n })),
+      [{ text: "⬅️ К группам", callback_data: "avs:0" }],
+    ]);
+  }
+  if (data.startsWith("avc:")) {
+    const shows = Number(data.slice(4)) || 0;
+    const { partners } = await registry(env, "partners_list", {});
+    const chosen = partners.filter((p) => p.status === "active" && st.groups.includes(String(p.chatId)));
+    const total = chosen.reduce((s, p) => s + p.price * shows, 0);
+    await setState(env, user.id, { kind: "req", groups: chosen.map((p) => String(p.chatId)), shows, total });
+    await ack();
+    return showScreen(
+      env,
+      chatId,
+      msgId,
+      "🧾 <b>Ваш заказ</b>\n\n" +
+        chosen.map((p) => `• ${esc(p.title)} — ${shows} × ${num(p.price, 3)} $ = ${num(p.price * shows)} $`).join("\n") +
+        `\n\n💰 <b>Итого: ${money(total, rate)}</b>\n\n` +
+        "✍️ Теперь <b>кратко расскажите, о чём реклама</b>: что продвигаете и для кого. Напишите ответ одним сообщением.",
+      [[{ text: "✖️ Отмена", callback_data: "adv" }]]
+    );
+  }
+  return ack();
 }
 
 async function advertiserAbout(env, msg, st) {
@@ -989,8 +1518,13 @@ async function advertiserAbout(env, msg, st) {
     return;
   }
   await setState(env, msg.from.id, null);
+  const [{ partners }, rate] = await Promise.all([registry(env, "partners_list", {}), uahRate(env)]);
+  const chosen = partners.filter((p) => (st.groups || []).includes(String(p.chatId)));
   const req = await registry(env, "req_add", {
-    req: { uid: msg.from.id, name: displayName(msg.from), username: msg.from.username || "", groups: st.groups, about },
+    req: {
+      uid: msg.from.id, name: displayName(msg.from), username: msg.from.username || "",
+      groups: st.groups || [], titles: chosen.map((p) => p.title), shows: st.shows || 0, total: st.total || 0, about,
+    },
     day: localDayStr(env),
   });
   const owner = await ownerUsername(env);
@@ -999,8 +1533,9 @@ async function advertiserAbout(env, msg, st) {
     parse_mode: "HTML",
     text:
       `✅ <b>Заявка №${req.n} принята!</b>\n\n` +
+      (st.total ? `Сумма: ${money(st.total, rate)}\n\n` : "") +
       (owner
-        ? `Чтобы обсудить детали, сроки и стоимость, напишите владельцу бота: @${esc(owner)}\nУкажите номер заявки — №${req.n}.`
+        ? `Чтобы обсудить детали и оплату, напишите владельцу бота: @${esc(owner)}\nУкажите номер заявки — №${req.n}.`
         : "Владелец бота свяжется с вами в ближайшее время."),
     reply_markup: { inline_keyboard: [owner ? [{ text: "✉️ Написать владельцу", url: "https://t.me/" + owner }] : [], BACK].filter((r) => r.length) },
   });
@@ -1011,58 +1546,74 @@ async function advertiserAbout(env, msg, st) {
       text:
         `📨 <b>Новая заявка на рекламу №${req.n}</b>\n\n` +
         `От: <a href="tg://user?id=${msg.from.id}">${esc(displayName(msg.from))}</a>${msg.from.username ? " @" + esc(msg.from.username) : ""}\n` +
-        `Групп: ${st.groups}\n\n<b>О чём:</b>\n${esc(about)}`,
+        (chosen.length
+          ? `Групп: ${chosen.length} — ${chosen.map((p) => esc(p.title)).join(", ")}\nПоказов в каждой: ${st.shows}\n💰 Сумма: ${money(st.total, rate)}\n`
+          : "") +
+        `\n<b>О чём:</b>\n${esc(about)}`,
     });
   }
 }
 
-// ---------- управление рекламой (только владелец) ----------
+// ================== РЕКЛАМА: УПРАВЛЕНИЕ (только владелец бота) ==================
+function adProgress(a) {
+  const pl = Object.values(a.placements || {});
+  return { ordered: pl.reduce((s, x) => s + (x.ordered || 0), 0), shown: pl.reduce((s, x) => s + (x.shown || 0), 0), groups: pl.length };
+}
+
 async function screenAdsAdmin(env, chatId, msgId) {
   const { ads } = await registry(env, "ads_all", {});
-  const now = Date.now();
-  const lines = ads.map((a) => {
-    const state = !a.active ? (a.until && a.until < now ? "⌛ закончилась" : "⏸ на паузе") : "✅ идёт";
+  const list = ads.filter((a) => a.placements);
+  const lines = list.map((a) => {
+    const pr = adProgress(a);
     return (
-      `<b>№${a.id}</b> ${adKindLabel(a)} · ${state} · показов: ${a.shows || 0}\n` +
-      `   ${a.groups === "all" ? "все группы" : "групп: " + a.groups.length}` +
-      (a.until ? ` · до ${fmtDate(env, a.until)}` : " · без срока") +
-      `\n   ${esc(a.plain.slice(0, 60))}${a.plain.length > 60 ? "…" : ""}`
+      `<b>№${a.id}</b> ${adKindLabel(a)} · ${a.active ? "✅ включена" : "⏸ выключена"} · показов ${pr.shown}/${pr.ordered} · групп ${pr.groups}\n` +
+      `   ${esc(a.plain.slice(0, 60))}${a.plain.length > 60 ? "…" : ""}`
     );
   });
-  const rows = ads.slice(0, 12).map((a) => [{ text: `№${a.id} — подробнее`, callback_data: "am:v:" + a.id }]);
+  const rows = list.slice(0, 12).map((a) => [{ text: `№${a.id} — подробнее`, callback_data: "am:v:" + a.id }]);
   rows.push([{ text: "➕ Новая реклама", callback_data: "am:new" }]);
-  rows.push([{ text: "📨 Заявки", callback_data: "am:req" }, { text: "👀 Как видят рекламодатели", callback_data: "advp" }]);
+  rows.push([{ text: "📨 Заявки", callback_data: "am:req" }, { text: "🤝 Партнёры", callback_data: "pp" }]);
+  rows.push([{ text: "👀 Как видят рекламодатели", callback_data: "advp" }]);
   rows.push(BACK);
   return showScreen(env, chatId, msgId, "📢 <b>Реклама — управление</b>\n\n" + (lines.join("\n\n") || "Реклам пока нет."), rows);
 }
 
 async function screenAdView(env, chatId, msgId, id) {
   const a = (await registry(env, "kv_get", { key: "ad:" + id })).value;
-  if (!a) return screenAdsAdmin(env, chatId, msgId);
+  if (!a || !a.placements) return screenAdsAdmin(env, chatId, msgId);
+  const { partners } = await registry(env, "partners_list", {});
+  const title = (gid) => partners.find((p) => String(p.chatId) === String(gid))?.title || gid;
+  const pr = adProgress(a);
   const html =
-    `📢 <b>Реклама №${a.id}</b> · ${adKindLabel(a)}\n` +
-    `${a.active ? "✅ идёт" : "⏸ не показывается"} · показов: ${a.shows || 0}\n` +
-    `Где: ${a.groups === "all" ? "все группы" : "выбрано групп — " + a.groups.length} · ${a.until ? "до " + fmtDate(env, a.until) : "без срока"}\n\n` +
+    `📢 <b>Реклама №${a.id}</b> · ${adKindLabel(a)} · ${a.active ? "✅ включена" : "⏸ выключена"}\n` +
+    `Показов: ${pr.shown} из ${pr.ordered}\n\n` +
+    Object.entries(a.placements)
+      .map(([gid, pl]) => `• ${esc(title(gid))} — ${pl.shown}/${pl.ordered} · ${PL_STATUS[pl.status] || pl.status}${pl.reason ? " (" + esc(pl.reason) + ")" : ""}`)
+      .join("\n") +
+    "\n\n" +
     (a.media
-      ? "<b>Подпись:</b>\n" + (a.html || "<i>без подписи</i>") + "\n\nФото/видео идёт отдельным сообщением прямо над сбором игроков."
+      ? "<b>Подпись:</b>\n" + (a.html || "<i>без подписи</i>")
       : "<b>Так она выглядит в группе:</b>\n\n" + adBlock(a.html) + "🐊 <b>Собираем игру!</b> Кто играет?…");
   return showScreen(env, chatId, msgId, html, [
     ...(a.media ? [[{ text: "👀 Показать как в группе", callback_data: "am:p:" + a.id }]] : []),
-    [{ text: a.active ? "⏸ Остановить" : "▶️ Запустить", callback_data: "am:x:" + a.id }, { text: "🗑 Удалить", callback_data: "am:del:" + a.id }],
+    [{ text: a.active ? "⏸ Выключить" : "▶️ Включить", callback_data: "am:x:" + a.id }, { text: "🗑 Удалить", callback_data: "am:del:" + a.id }],
     [{ text: "⬅️ Все рекламы", callback_data: "adv" }],
   ]);
 }
 
 async function screenAdGroups(env, chatId, msgId, st, page = 0) {
-  const { groups } = await registry(env, "groups_list", {});
-  const pages = Math.max(1, Math.ceil(groups.length / ADS_GROUPS_PAGE));
+  const { partners } = await registry(env, "partners_list", {});
+  const active = partners.filter((p) => p.status === "active").sort((a, b) => (b.members || 0) - (a.members || 0));
+  if (!active.length) {
+    return showScreen(env, chatId, msgId, "😔 Пока нет групп-партнёров — реклама показывается только в них. Пригласи владельцев групп в раздел «🤝 Владельцам групп».", [
+      [{ text: "⬅️ Реклама", callback_data: "am:cancel" }],
+    ]);
+  }
+  const pages = Math.max(1, Math.ceil(active.length / ADS_GROUPS_PAGE));
   page = Math.min(Math.max(0, page), pages - 1);
-  const sel = st.groups === "all" ? null : new Set((st.groups || []).map(String));
-  const rows = groups.slice(page * ADS_GROUPS_PAGE, (page + 1) * ADS_GROUPS_PAGE).map((g) => [
-    {
-      text: `${!sel || sel.has(String(g.chatId)) ? "✅" : "⬜️"} ${String(g.title || "Группа").slice(0, 28)}${g.members ? " · 👥" + g.members : ""}`,
-      callback_data: `am:t:${g.chatId}:${page}`,
-    },
+  const sel = new Set((st.groups || []).map(String));
+  const rows = active.slice(page * ADS_GROUPS_PAGE, (page + 1) * ADS_GROUPS_PAGE).map((p) => [
+    { text: `${sel.has(String(p.chatId)) ? "✅" : "⬜️"} ${String(p.title).slice(0, 24)} · 👥${p.members} · ${num(p.price, 3)}$`, callback_data: `am:t:${p.chatId}:${page}` },
   ]);
   if (pages > 1) {
     const nav = [];
@@ -1071,18 +1622,39 @@ async function screenAdGroups(env, chatId, msgId, st, page = 0) {
     if (page < pages - 1) nav.push({ text: "▶️", callback_data: "am:g:" + (page + 1) });
     rows.push(nav);
   }
-  rows.push([{ text: "🌍 Все группы", callback_data: "am:all:" + page }, { text: "⬜️ Снять все", callback_data: "am:none:" + page }]);
-  const count = sel ? sel.size : groups.length;
-  rows.push([{ text: `➡️ Дальше (${sel ? count + " выбрано" : "все группы"})`, callback_data: "am:next" }]);
+  rows.push([{ text: "🌍 Все партнёры", callback_data: "am:all:" + page }, { text: "⬜️ Снять все", callback_data: "am:none:" + page }]);
+  rows.push([{ text: `➡️ Дальше (${sel.size} выбрано)`, callback_data: "am:next" }]);
   rows.push([{ text: "✖️ Отмена", callback_data: "am:cancel" }]);
   return showScreen(
     env,
     chatId,
     msgId,
-    "📢 <b>Новая реклама — шаг 2 из 3</b>\n\nВыбери, <b>в каких группах</b> показывать. Нажатие на группу ставит или снимает галочку.\n" +
-      "«Все группы» — реклама пойдёт и в группы, которые подключатся позже.",
+    "📢 <b>Новая реклама — шаг 2 из 3</b>\n\nВыбери <b>группы-партнёры</b>. В скобках — цена за показ, которую назначил владелец группы.",
     rows
   );
+}
+
+async function sendPlacementRequest(env, ad, p, ordered, rate, commission) {
+  if (ad.media) await sendAdMedia(env, p.ownerId, ad);
+  else await tg(env, "sendMessage", { chat_id: p.ownerId, parse_mode: "HTML", link_preview_options: { is_disabled: true }, text: adBlock(ad.html) + "🐊 <b>Собираем игру!</b> Кто играет?…" });
+  const sum = p.price * ordered;
+  const net = sum * (1 - commission / 100);
+  return tg(env, "sendMessage", {
+    chat_id: p.ownerId,
+    parse_mode: "HTML",
+    text:
+      `☝️ <b>Новая реклама №${ad.id} для группы «${esc(p.title)}»</b>\n\n` +
+      `Показов: ${ordered} × ${money(p.price, rate)}\n` +
+      `💰 Вы получите: <b>${money(net, rate)}</b>${commission ? ` (комиссия бота ${commission}%)` : ""}\n\n` +
+      "Реклама начнёт показываться после /game, только если вы её одобрите. Ответить нужно в течение 24 часов.",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "✅ Одобрить", callback_data: `pa:y:${ad.id}:${p.chatId}` }],
+        [{ text: "❌ Не подходит тематика", callback_data: `pa:n:${ad.id}:${p.chatId}:t` }],
+        [{ text: "❌ Не нравится подача", callback_data: `pa:n:${ad.id}:${p.chatId}:s` }, { text: "❌ Другое", callback_data: `pa:n:${ad.id}:${p.chatId}:o` }],
+      ],
+    },
+  });
 }
 
 async function handleAdsCallback(env, cq, data) {
@@ -1124,10 +1696,9 @@ async function handleAdsCallback(env, cq, data) {
     const a = (await registry(env, "kv_get", { key: "ad:" + parts[2] })).value;
     if (a) {
       a.active = !a.active;
-      if (a.active && a.until && a.until < Date.now()) a.until = null; // перезапуск закончившейся — без срока
       await registry(env, "kv_put", { key: "ad:" + a.id, value: a });
     }
-    await ack(a?.active ? "Реклама запущена" : "Реклама остановлена");
+    await ack(a?.active ? "Реклама включена" : "Реклама выключена");
     return screenAdView(env, chatId, msgId, parts[2]);
   }
   if (act === "del") {
@@ -1137,14 +1708,15 @@ async function handleAdsCallback(env, cq, data) {
   }
   if (act === "req") {
     await ack();
-    const { reqs } = await registry(env, "req_list", {});
+    const [{ reqs }, rate] = await Promise.all([registry(env, "req_list", {}), uahRate(env)]);
     const html =
       "📨 <b>Заявки на рекламу</b> (последние 10)\n\n" +
       (reqs
         .map(
           (r) =>
-            `<b>№${r.n}</b> · ${fmtDateTime(env, r.at)} · групп: ${r.groups}\n` +
-            `<a href="tg://user?id=${r.uid}">${esc(r.name)}</a>${r.username ? " @" + esc(r.username) : ""}\n` +
+            `<b>№${r.n}</b> · ${fmtDateTime(env, r.at)}` +
+            (Array.isArray(r.groups) && r.groups.length ? ` · групп: ${r.groups.length} × ${r.shows} показов · ${money(r.total || 0, rate)}` : "") +
+            `\n<a href="tg://user?id=${r.uid}">${esc(r.name)}</a>${r.username ? " @" + esc(r.username) : ""}\n` +
             `${esc(String(r.about).slice(0, 200))}`
         )
         .join("\n\n") || "Заявок пока нет.");
@@ -1159,15 +1731,14 @@ async function handleAdsCallback(env, cq, data) {
   }
   if (act === "g") return ack().then(() => screenAdGroups(env, chatId, msgId, st, Number(parts[2]) || 0));
   if (act === "all" || act === "none") {
-    st.groups = act === "all" ? "all" : [];
+    const { partners } = await registry(env, "partners_list", {});
+    st.groups = act === "all" ? partners.filter((p) => p.status === "active").map((p) => String(p.chatId)) : [];
     await setState(env, uid, st);
     await ack();
     return screenAdGroups(env, chatId, msgId, st, Number(parts[2]) || 0);
   }
   if (act === "t") {
-    // chatId группы отрицательный: "am:t:-100123:0" → parts[2] = "-100123"
-    const gid = parts[2];
-    if (st.groups === "all") st.groups = ((await registry(env, "groups_list", {})).groups || []).map((g) => String(g.chatId));
+    const gid = parts[2]; // chatId группы отрицательный: "am:t:-100123:0"
     const set = new Set((st.groups || []).map(String));
     set.has(gid) ? set.delete(gid) : set.add(gid);
     st.groups = [...set];
@@ -1176,22 +1747,30 @@ async function handleAdsCallback(env, cq, data) {
     return screenAdGroups(env, chatId, msgId, st, Number(parts[3]) || 0);
   }
   if (act === "next") {
-    if (st.groups !== "all" && !(st.groups || []).length) return ack("Выбери хотя бы одну группу", true);
+    if (!(st.groups || []).length) return ack("Выбери хотя бы одну группу", true);
     await ack();
-    return showScreen(env, chatId, msgId, "📢 <b>Новая реклама — шаг 3 из 3</b>\n\n<b>Сколько дней показывать?</b>", [
-      [{ text: "3 дня", callback_data: "am:d:3" }, { text: "7 дней", callback_data: "am:d:7" }],
-      [{ text: "14 дней", callback_data: "am:d:14" }, { text: "30 дней", callback_data: "am:d:30" }],
-      [{ text: "Без срока (пока не остановлю)", callback_data: "am:d:0" }],
+    return showScreen(env, chatId, msgId, "📢 <b>Новая реклама — шаг 3 из 3</b>\n\n<b>Сколько показов в каждой группе?</b>", [
+      SHOW_OPTIONS.map((n) => ({ text: String(n), callback_data: "am:n:" + n })),
       [{ text: "⬅️ Назад к группам", callback_data: "am:g:0" }, { text: "✖️ Отмена", callback_data: "am:cancel" }],
     ]);
   }
-  if (act === "d") {
-    const days = Number(parts[2]) || 0;
+  if (act === "n") {
+    const ordered = Number(parts[2]) || 10;
+    const [{ partners }, rate, cfg] = await Promise.all([registry(env, "partners_list", {}), uahRate(env), adCfg(env)]);
+    const chosen = partners.filter((p) => p.status === "active" && st.groups.includes(String(p.chatId)));
     const res = await registry(env, "ad_create", {
-      ad: { html: st.html, plain: st.plain, media: st.media || null, file: st.file || null, groups: st.groups === "all" ? "all" : st.groups, until: days ? Date.now() + days * 86400000 : null },
+      ad: { html: st.html, plain: st.plain, media: st.media || null, file: st.file || null, groups: chosen.map((p) => String(p.chatId)), ordered },
     });
     await setState(env, uid, null);
-    await ack("Реклама запущена ✅");
+    await ack("Отправлено владельцам на одобрение");
+    for (const p of chosen) {
+      await sendPlacementRequest(env, { ...st, id: res.id }, p, ordered, rate, commissionNow(cfg)).catch((e) => console.log("placement send", String(e)));
+    }
+    await tg(env, "sendMessage", {
+      chat_id: chatId,
+      parse_mode: "HTML",
+      text: `📨 Реклама №${res.id} отправлена на одобрение владельцам ${chosen.length} групп. Она начнёт показываться в каждой группе сразу после одобрения. Кто не ответит за 24 часа — пропускается.`,
+    });
     return screenAdView(env, chatId, msgId, res.id);
   }
   return ack();
@@ -1203,6 +1782,18 @@ async function handlePrivateState(env, msg) {
   if (!st) return false;
   if (st.kind === "req") {
     await advertiserAbout(env, msg, st);
+    return true;
+  }
+  if (st.kind === "price") {
+    const t = String(msg.text || "").toLowerCase().replace(",", ".");
+    const n = parseFloat(t.replace(/[^0-9.]/g, ""));
+    if (!(n > 0)) {
+      await tg(env, "sendMessage", { chat_id: msg.chat.id, parse_mode: "HTML", text: "⚠️ Не понял цену. Напишите число, например <code>0.4</code> или <code>15 грн</code>." });
+      return true;
+    }
+    const usd = /грн|uah|₴|гр/.test(t) ? n / (await uahRate(env)) : n;
+    await setState(env, msg.from.id, null);
+    await partnerSubmit(env, msg.chat.id, null, msg.from, st.chatId, Math.round(usd * 1000) / 1000);
     return true;
   }
   if (st.kind === "ad" && st.step === "text" && isOwnerId(env, msg.from.id)) {
@@ -1235,7 +1826,7 @@ async function handlePrivateState(env, msg) {
       html = esc(plain); // оформление не прошло — берём простой текст
       await preview(html);
     }
-    const next = { kind: "ad", step: "groups", html, plain, media: media?.media || null, file: media?.file || null, groups: "all" };
+    const next = { kind: "ad", step: "groups", html, plain, media: media?.media || null, file: media?.file || null, groups: [] };
     await setState(env, msg.from.id, next);
     await screenAdGroups(env, msg.chat.id, null, next, 0);
     return true;
@@ -2345,7 +2936,7 @@ export class CrocodileGame extends DurableObject {
     for (const p of prefill) this.game.roster[p.id] = { name: p.name, at: now };
     if (initiator) this.game.roster[initiator.id] = { name: displayName(initiator), at: now };
     await this.ctx.storage.put("game", this.game);
-    const r = { status: "lobby", chatId, msgId: null, startedAt: now, deadline: now + LOBBY_MS, ad: ad && !ad.media ? ad.html : null };
+    const r = { status: "lobby", chatId, msgId: null, startedAt: now, deadline: now + LOBBY_MS, ad: ad && !ad.media ? ad.html : null, adId: ad?.id || null, adCounted: false };
     this.round = r;
     await this.save();
     if (ad?.media) await sendAdMedia(this.env, chatId, ad).catch(() => {}); // фото/видео/GIF — отдельным сообщением над сбором
@@ -2358,6 +2949,15 @@ export class CrocodileGame extends DurableObject {
     r.msgId = res.result.message_id;
     await this.save();
     await this.ctx.storage.setAlarm(r.deadline);
+    await this.maybeCountAd(r);
+  }
+
+  // показ рекламы засчитывается, когда в сбор записались минимум 2 игрока
+  async maybeCountAd(r) {
+    if (!r.adId || r.adCounted || this.activePlayers().length < 2) return;
+    r.adCounted = true;
+    await this.save();
+    await this.registry("ad_count", { adId: r.adId, chatId: r.chatId, starter: this.game?.initiator || null, day: localDayStr(this.env) }).catch(() => {});
   }
 
   async onLobby(cq, data) {
@@ -2370,6 +2970,7 @@ export class CrocodileGame extends DurableObject {
       await this.save();
       await this.ctx.storage.setAlarm(r.deadline);
       if (!was) await this.edit(r.chatId, r.msgId, await this.lobbyText(), this.lobbyKeyboard());
+      if (!was) await this.maybeCountAd(r);
       return;
     }
     if (data === "lgo") {
@@ -4370,6 +4971,15 @@ export class ArenaRegistry extends DurableObject {
       } else if (path === "ads_all") out = await this.adsAll();
       else if (path === "ad_create") out = await this.adCreate(body.ad || {});
       else if (path === "ad_delete") out = await this.adDelete(String(body.id));
+      else if (path === "ad_count") out = await this.adCount(String(body.adId), body.chatId, body.starter, body.day);
+      else if (path === "placement_decide") out = await this.placementDecide(String(body.adId), String(body.chatId), body.uid, !!body.ok, body.reason);
+      else if (path === "housekeeping") out = await this.housekeeping();
+      else if (path === "partners_list") out = await this.partnersList();
+      else if (path === "partners_of") out = await this.partnersOf(body.uid);
+      else if (path === "partner_apply") out = await this.partnerApply(body.p || {});
+      else if (path === "partner_decide") out = await this.partnerDecide(String(body.chatId), !!body.ok);
+      else if (path === "partner_leave") out = await this.partnerLeave(String(body.chatId), body.uid);
+      else if (path === "partner_paid") out = await this.partnerPaid(String(body.chatId));
       else if (path === "req_add") out = await this.reqAdd(body.req || {}, body.day);
       else if (path === "req_list") out = await this.reqList();
       else if (path === "is_official") out = { official: String((await this.ctx.storage.get("official")) || "") === String(body.chatId) };
@@ -4554,7 +5164,13 @@ export class ArenaRegistry extends DurableObject {
   async adCreate(ad) {
     const id = ((await this.ctx.storage.get("ad_seq")) || 0) + 1;
     const ids = (await this.ctx.storage.get("ads")) || [];
-    const a = { id, html: String(ad.html || ""), plain: String(ad.plain || ""), media: ad.media || null, file: ad.file || null, groups: ad.groups === "all" ? "all" : (ad.groups || []).map(String), until: ad.until || null, active: true, shows: 0, created: Date.now() };
+    const placements = {};
+    for (const gid of ad.groups || []) {
+      const p = await this.ctx.storage.get("partner:" + gid);
+      if (!p || p.status !== "active") continue;
+      placements[gid] = { ordered: Number(ad.ordered) || 10, shown: 0, price: p.price, status: "await", sentAt: Date.now() };
+    }
+    const a = { id, html: String(ad.html || ""), plain: String(ad.plain || ""), media: ad.media || null, file: ad.file || null, placements, active: true, shows: 0, created: Date.now() };
     await this.ctx.storage.put({ ad_seq: id, ads: [...ids, id], ["ad:" + id]: a });
     return { id };
   }
@@ -4564,21 +5180,167 @@ export class ArenaRegistry extends DurableObject {
     await this.ctx.storage.delete("ad:" + id);
     return { ok: true };
   }
-  // /game в группе: считаем запуск и выбираем рекламу для этой группы (та, что показывалась реже)
+  // /game в группе: считаем запуск и выбираем рекламу для этой группы.
+  // Реклама — только в группах-партнёрах, только одобренная владельцем и пока не открутила заказанные показы.
   async lobbyStart(chatId, day) {
     await this.dayBump(day, "games");
+    const gk = "gs:" + chatId; // запуски игры по дням в этой группе (для активности)
+    const gs = (await this.ctx.storage.get(gk)) || {};
+    gs[day] = (gs[day] || 0) + 1;
+    for (const d of Object.keys(gs).sort().slice(0, -14)) delete gs[d];
+    await this.ctx.storage.put(gk, gs);
+
+    const partner = await this.ctx.storage.get("partner:" + chatId);
+    if (!partner || partner.status !== "active") return {};
+    const last = await this.ctx.storage.get("pc:" + chatId);
+    if (last && Date.now() - last.at < COUNT_GAP_MS) return {}; // недавно уже был засчитанный показ — не надоедаем
     const { ads } = await this.adsAll();
     let best = null;
+    let bestLeft = 0;
     for (const a of ads) {
-      if (!a.active) continue;
-      if (a.groups !== "all" && !a.groups.includes(String(chatId))) continue;
-      if (!best || (a.shows || 0) < (best.shows || 0)) best = a;
+      const pl = a.active && a.placements?.[String(chatId)];
+      if (!pl || pl.status !== "approved" || pl.shown >= pl.ordered) continue;
+      const left = 1 - pl.shown / pl.ordered; // больше осталось открутить — выше приоритет
+      if (!best || left > bestLeft) [best, bestLeft] = [a, left];
     }
     if (!best) return {};
-    best.shows = (best.shows || 0) + 1;
-    await this.ctx.storage.put("ad:" + best.id, best);
-    await this.dayBump(day, "imps");
     return { html: best.html, id: best.id, media: best.media || null, file: best.file || null };
+  }
+  gamesWeek(gs, days) {
+    return days.reduce((s, d) => s + (gs?.[d] || 0), 0);
+  }
+  // Показ засчитывается: в сбор записались 2+ игрока, в группе не чаще раза в 30 минут, один запустивший — не чаще раза в 2 часа
+  async adCount(adId, chatId, starter, day) {
+    const now = Date.now();
+    const last = await this.ctx.storage.get("pc:" + chatId);
+    if (last && now - last.at < COUNT_GAP_MS) return { counted: false, why: "gap" };
+    if (last && starter && String(last.starter) === String(starter) && now - last.at < SAME_STARTER_MS) return { counted: false, why: "same" };
+    const a = await this.ctx.storage.get("ad:" + adId);
+    const pl = a?.placements?.[String(chatId)];
+    const p = await this.ctx.storage.get("partner:" + chatId);
+    if (!a || !a.active || !pl || pl.status !== "approved" || pl.shown >= pl.ordered || !p || p.status !== "active") return { counted: false, why: "state" };
+    const cfg = { ...AD_DEFAULTS, ...((await this.ctx.storage.get("adcfg")) || {}) };
+    const net = pl.price * (1 - commissionNow(cfg, now) / 100);
+    pl.shown += 1;
+    a.shows = (a.shows || 0) + 1;
+    p.shows = (p.shows || 0) + 1;
+    p.earned = Math.round(((p.earned || 0) + net) * 10000) / 10000;
+    p.pending = Math.round(((p.pending || 0) + net) * 10000) / 10000;
+    const done = pl.shown >= pl.ordered;
+    if (done) pl.status = "done";
+    await this.ctx.storage.put({ ["ad:" + adId]: a, ["partner:" + chatId]: p, ["pc:" + chatId]: { at: now, starter: starter || null } });
+    await this.dayBump(day, "imps");
+    await this.dayBump(day, "earn", net);
+    if (done) {
+      const sum = pl.price * pl.ordered * (1 - commissionNow(cfg, now) / 100);
+      await this.send(p.ownerId, `✅ <b>Реклама №${a.id} в «${esc(p.title)}» откручена полностью</b> (показов: ${pl.ordered}).\n💰 Начислено: ${num(sum)} $. К выплате всего: <b>${num(p.pending)} $</b>.\nНапишите владельцу бота, куда перевести деньги.`).catch(() => {});
+      if (this.env.OWNER_ID) await this.send(this.env.OWNER_ID, `✔️ Реклама №${a.id} выполнена в «${esc(p.title)}» (показов: ${pl.ordered}). К выплате владельцу: ${num(p.pending)} $ → меню → 🤝 Партнёры → 💸 Выплаты`).catch(() => {});
+    }
+    return { counted: true, done };
+  }
+  async placementDecide(adId, chatId, uid, ok, reason) {
+    const p = await this.ctx.storage.get("partner:" + chatId);
+    if (!p || String(p.ownerId) !== String(uid)) return { ok: false, text: "Это решение может принять только владелец группы" };
+    const a = await this.ctx.storage.get("ad:" + adId);
+    const pl = a?.placements?.[String(chatId)];
+    if (!pl) return { ok: false, text: "Реклама не найдена" };
+    if (pl.status !== "await") return { ok: false, text: "Решение уже принято или время вышло" };
+    pl.status = ok ? "approved" : "rejected";
+    pl.reason = ok ? "" : reason || "";
+    pl.decidedAt = Date.now();
+    await this.ctx.storage.put("ad:" + adId, a);
+    return { ok: true, title: p.title, text: ok ? "Одобрено" : "Отказ записан" };
+  }
+  // раз в час: кто не ответил за 24 часа — пропускаем; включаем запланированную комиссию
+  async housekeeping() {
+    const now = Date.now();
+    const { ads } = await this.adsAll();
+    const expired = [];
+    for (const a of ads) {
+      let changed = false;
+      for (const [gid, pl] of Object.entries(a.placements || {})) {
+        if (pl.status === "await" && now - (pl.sentAt || 0) > APPROVE_MS) {
+          pl.status = "expired";
+          changed = true;
+          const p = await this.ctx.storage.get("partner:" + gid);
+          expired.push(`№${a.id} — ${p?.title || gid}`);
+        }
+      }
+      if (changed) await this.ctx.storage.put("ad:" + a.id, a);
+    }
+    const cfg = (await this.ctx.storage.get("adcfg")) || {};
+    if (cfg.nextFrom && now >= cfg.nextFrom) {
+      await this.ctx.storage.put("adcfg", { ...cfg, commission: cfg.nextCommission || 0, nextCommission: null, nextFrom: null });
+    }
+    if (expired.length && this.env.OWNER_ID) {
+      await this.send(this.env.OWNER_ID, "⌛ Владельцы не ответили за 24 часа — реклама там не показывается:\n" + expired.map((x) => "• " + esc(x)).join("\n")).catch(() => {});
+    }
+    return { expired: expired.length };
+  }
+  // ---------- партнёры ----------
+  async partnersAll() {
+    return [...(await this.ctx.storage.list({ prefix: "partner:" })).values()];
+  }
+  async partnersList() {
+    const all = await this.partnersAll();
+    for (const p of all) {
+      const g = await this.ctx.storage.get("g:" + p.chatId);
+      if (g?.members) p.members = g.members;
+      if (g?.title) p.title = g.title;
+      if (g?.removed && p.status === "active") p.status = "left"; // бота удалили из группы
+    }
+    return { partners: all };
+  }
+  async partnerApply(np) {
+    const key = "partner:" + np.chatId;
+    const old = await this.ctx.storage.get(key);
+    const gs = await this.ctx.storage.get("gs:" + np.chatId);
+    const days = [];
+    for (let i = 0; i < 7; i++) days.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
+    const games7 = this.gamesWeek(gs, days);
+    if (old && (old.status === "active" || old.status === "pending") && String(old.ownerId) === String(np.ownerId)) {
+      old.price = np.price;
+      old.title = np.title;
+      old.members = np.members;
+      await this.ctx.storage.put(key, old);
+      if (old.status === "active") return { priceChanged: true, games7 };
+      return { games7 };
+    }
+    const p = { ...(old || {}), ...np, status: "pending", appliedAt: Date.now(), earned: old?.earned || 0, pending: old?.pending || 0, paid: old?.paid || 0, shows: old?.shows || 0 };
+    await this.ctx.storage.put(key, p);
+    return { games7 };
+  }
+  async partnerDecide(chatId, ok) {
+    const key = "partner:" + chatId;
+    const p = await this.ctx.storage.get(key);
+    if (!p || p.status !== "pending") return { ok: false };
+    p.status = ok ? "active" : "rejected";
+    p.decidedAt = Date.now();
+    await this.ctx.storage.put(key, p);
+    return { ok: true, ownerId: p.ownerId, title: p.title };
+  }
+  async partnerLeave(chatId, uid) {
+    const key = "partner:" + chatId;
+    const p = await this.ctx.storage.get(key);
+    if (!p || String(p.ownerId) !== String(uid)) return { ok: false };
+    p.status = "left";
+    p.leftAt = Date.now();
+    await this.ctx.storage.put(key, p);
+    return { ok: true, title: p.title };
+  }
+  async partnerPaid(chatId) {
+    const key = "partner:" + chatId;
+    const p = await this.ctx.storage.get(key);
+    if (!p || !(p.pending > 0)) return { amount: 0 };
+    const amount = p.pending;
+    p.paid = Math.round(((p.paid || 0) + amount) * 10000) / 10000;
+    p.pending = 0;
+    p.payouts = [...(p.payouts || []), { at: Date.now(), amount }].slice(-50);
+    await this.ctx.storage.put(key, p);
+    return { amount, ownerId: p.ownerId, title: p.title };
+  }
+  async partnersOf(uid) {
+    return { partners: (await this.partnersAll()).filter((p) => String(p.ownerId) === String(uid)) };
   }
   async reqAdd(req, day) {
     const n = ((await this.ctx.storage.get("rq_seq")) || 0) + 1;
