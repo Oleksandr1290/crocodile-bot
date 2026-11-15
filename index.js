@@ -60,7 +60,7 @@ const LOBBY_TTL_MS = 48 * 60 * 60 * 1000;   // сколько лобби ждё�
 const INVITE_LIMIT = 30;                     // максимум групп, куда рассылается вызов
 const MIN_GUESS_SEC = 4;                     // угадал быстрее — очки "на сложном" не идут (защита от сговора)
 const PAIR_DAILY_LIMIT = 5;                  // одна пара ведущий→угадавший: максимум N зачётных раундов в день
-const minPoints = (env) => Number(env.ARENA_MIN_POINTS) || 1000;
+const minPoints = (env) => Number(env.ARENA_MIN_POINTS) || 10000;
 const minPlayers = (env) => Number(env.ARENA_MIN_PLAYERS) || 5;
 const lobbySize = (env) => Number(env.ARENA_LOBBY_SIZE) || 4;
 
@@ -116,6 +116,10 @@ async function dbInit(env) {
       "CREATE TABLE IF NOT EXISTS groups (chat_id INTEGER PRIMARY KEY, title TEXT, username TEXT, level TEXT, players INTEGER, updated_at INTEGER)"
     ),
     env.DB.prepare("CREATE TABLE IF NOT EXISTS hints (word TEXT PRIMARY KEY, data TEXT, created_at INTEGER)"),
+    env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS bot_users (user_id INTEGER PRIMARY KEY, name TEXT, username TEXT, lang TEXT, source TEXT, started_at INTEGER)"
+    ),
+    env.DB.prepare("CREATE INDEX IF NOT EXISTS bot_users_started ON bot_users (started_at)"),
   ]);
   dbReady = true;
   return true;
@@ -229,7 +233,7 @@ export default {
           await stub.fetch("https://game/update", { method: "POST", body: JSON.stringify(update) });
         } else if (chat.type === "private" && update.callback_query) {
           await handlePrivateCallback(env, update.callback_query);
-        } else if (chat.type === "private" && update.message?.text) {
+        } else if (chat.type === "private" && update.message) {
           await handlePrivate(env, update.message);
         }
       } catch (e) {
@@ -259,10 +263,33 @@ async function runTick(env) {
       console.log("tick failed", chatId, String(e));
     }
   }
+  await maybeReports(env, tick).catch((e) => console.log("reports failed", String(e)));
 }
 
 async function handlePrivate(env, msg) {
+  if (!msg.text) {
+    // фото, видео, GIF — нужны только когда бот ждёт рекламу
+    await handlePrivateState(env, msg);
+    return;
+  }
   const cmd = msg.text.trim().split(/\s+/)[0].split("@")[0].toLowerCase();
+  const isCmd = msg.text.trim().startsWith("/");
+
+  // бот ждёт ответ (текст рекламы, описание заявки)?
+  if (!isCmd && (await handlePrivateState(env, msg))) return;
+  if (isCmd) await setState(env, msg.from.id, null).catch(() => {});
+
+  if (cmd === "/start") {
+    await trackStart(env, msg, msg.text.trim().split(/\s+/)[1] || "").catch((e) => console.log("trackStart", String(e)));
+  }
+
+  if (isOwnerId(env, msg.from.id)) {
+    if (cmd === "/stats") return screenStats(env, msg.chat.id, null);
+    if (cmd === "/ads") return screenAdsAdmin(env, msg.chat.id, null);
+    if (cmd === "/report_week" || cmd === "/report_month") {
+      return tg(env, "sendMessage", { chat_id: msg.chat.id, parse_mode: "HTML", text: await buildReport(env, cmd === "/report_week" ? "week" : "month") });
+    }
+  }
 
   if (cmd === "/myid") {
     return tg(env, "sendMessage", {
@@ -315,7 +342,10 @@ async function screenMain(env, chatId, user, msgId) {
     [{ text: "🏟 Супер-игра", callback_data: "arena" }, { text: "📖 Правила", callback_data: "rules" }],
   ];
   if (username) rows.push([{ text: "➕ Добавить бота в свою группу", url: `https://t.me/${username}?startgroup=true` }]);
-  if (isOwnerId(env, user.id)) rows.push([{ text: "🎛 Пульт Арены", callback_data: "ap:status" }]);
+  rows.push([{ text: "📢 Реклама", callback_data: "adv" }]);
+  if (isOwnerId(env, user.id)) {
+    rows.push([{ text: "🎛 Пульт Арены", callback_data: "ap:status" }, { text: "📈 Статистика бота", callback_data: "st" }]);
+  }
   return showScreen(
     env,
     chatId,
@@ -501,7 +531,7 @@ const RULES = {
     button: "🏟 Супер-игра",
     text:
       "🏟 <b>Супер-игра</b>\n\n" +
-      "Лидер группы (№1 в рейтинге группы), набравший 1000+ 🔥 очков на 🔴 Сложном или 💀 Ультимейте, " +
+      "Лидер группы (№1 в рейтинге группы), набравший 10 000+ 🔥 очков на 🔴 Сложном или 💀 Ультимейте, " +
       "бросает вызов лидерам других групп (меню → 🏟 Супер-игра).\n\n" +
       "Когда лобби соберётся, участники получают вход на Арену — отдельную группу, где писать могут только они. " +
       "Соперники видят друг друга как «Группа #N».\n\n" +
@@ -626,6 +656,24 @@ async function handlePrivateCallback(env, cq) {
   if (data === "howto" || data === "rules") return ack().then(() => screenRules(env, chatId, msgId, null));
   if (data.startsWith("rules:")) return ack().then(() => screenRules(env, chatId, msgId, data.slice(6)));
   if (data.startsWith("gt:")) return ack().then(() => screenGroupTop(env, chatId, user, data.slice(3), msgId));
+  if (data === "adv") {
+    await ack();
+    await setState(env, user.id, null);
+    if (isOwnerId(env, user.id)) return screenAdsAdmin(env, chatId, msgId);
+    return screenAdvertiser(env, chatId, msgId);
+  }
+  if (data.startsWith("avn:")) return ack().then(() => advertiserChose(env, chatId, msgId, user, Number(data.slice(4)) || 0));
+  if (data === "st" || data.startsWith("st:") || data === "advp" || data.startsWith("am:")) {
+    if (!isOwnerId(env, user.id)) return ack("Только для владельца");
+    if (data === "advp") return ack().then(() => screenAdvertiser(env, chatId, msgId, true));
+    if (data.startsWith("am:")) return handleAdsCallback(env, cq, data);
+    if (data === "st:last") return ack().then(() => screenLastUsers(env, chatId, msgId));
+    if (data === "st:rw" || data === "st:rm") {
+      await ack("Готовлю отчёт…");
+      return tg(env, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text: await buildReport(env, data === "st:rw" ? "week" : "month") });
+    }
+    return ack().then(() => screenStats(env, chatId, msgId));
+  }
   if (data.startsWith("ap:")) {
     if (!isOwnerId(env, user.id)) return ack("Только для владельца");
     await ack();
@@ -658,6 +706,541 @@ async function registry(env, path, body) {
   const stub = env.REGISTRY.get(env.REGISTRY.idFromName("main"));
   const res = await stub.fetch("https://registry/" + path, { method: "POST", body: JSON.stringify(body) });
   return res.json();
+}
+
+// ================== СТАТИСТИКА БОТА И РЕКЛАМА ==================
+// Кто нажал «Старт» в личке — записывается в D1 (таблица bot_users) один раз, при первом нажатии.
+// Отчёты владельцу: каждое воскресенье и в последний день месяца в REPORT_HOUR (по времени ALIVE_TZ).
+// Реклама хранится в реестре (ArenaRegistry) и показывается в первом сообщении после /game.
+const REPORT_HOUR = 21;
+const AD_MAX_LEN = 700;          // длина текста рекламы
+const AD_CAPTION_MAX = 900;      // подпись к фото/видео (у Telegram предел 1024)
+const AD_MEDIA = { photo: ["sendPhoto", "photo", "🖼 фото"], video: ["sendVideo", "video", "🎬 видео"], animation: ["sendAnimation", "animation", "🎞 GIF"] };
+const ADS_GROUPS_PAGE = 8;       // групп на странице при выборе
+const STATE_TTL_MS = 60 * 60 * 1000; // сколько бот ждёт ответа (текст рекламы, описание заявки)
+const AD_LINE = "➖➖➖➖➖➖➖➖";
+
+function localDayStr(env, ts = Date.now()) {
+  return new Date(ts + tzOffset(env) * 3600 * 1000).toISOString().slice(0, 10);
+}
+// Начало местных суток N дней назад (0 — сегодня), в миллисекундах UTC
+function localMidnight(env, daysAgo = 0) {
+  const off = tzOffset(env) * 3600 * 1000;
+  const d = new Date(Date.now() + off);
+  d.setUTCHours(0, 0, 0, 0);
+  return d.getTime() - off - daysAgo * 86400000;
+}
+function localMonthStart(env, monthsAgo = 0) {
+  const off = tzOffset(env) * 3600 * 1000;
+  const d = new Date(Date.now() + off);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - monthsAgo, 1) - off;
+}
+function fmtDate(env, ts) {
+  const d = new Date(ts + tzOffset(env) * 3600 * 1000);
+  return String(d.getUTCDate()).padStart(2, "0") + "." + String(d.getUTCMonth() + 1).padStart(2, "0");
+}
+function fmtDateTime(env, ts) {
+  const d = new Date(ts + tzOffset(env) * 3600 * 1000);
+  return fmtDate(env, ts) + " " + String(d.getUTCHours()).padStart(2, "0") + ":" + String(d.getUTCMinutes()).padStart(2, "0");
+}
+function daysBetween(env, from, to) {
+  const out = [];
+  for (let t = from; t < to; t += 86400000) out.push(localDayStr(env, t + 3600000));
+  return out;
+}
+function pct(now, before) {
+  if (!before) return now ? " (раньше: 0)" : "";
+  const p = Math.round(((now - before) / before) * 100);
+  return ` (раньше: ${before}, ${p >= 0 ? "+" : ""}${p}%)`;
+}
+function sourceName(s) {
+  if (!s) return "напрямую";
+  if (s === "me" || s === "arena" || s === "catalog" || s.startsWith("top_") || s.startsWith("rules")) return "из групп (кнопки бота)";
+  return s;
+}
+
+// Текст из Telegram с оформлением (жирный, ссылки…) → HTML
+function entitiesToHtml(text, entities = []) {
+  const simple = {
+    bold: ["<b>", "</b>"], italic: ["<i>", "</i>"], underline: ["<u>", "</u>"], strikethrough: ["<s>", "</s>"],
+    code: ["<code>", "</code>"], spoiler: ["<tg-spoiler>", "</tg-spoiler>"],
+  };
+  const opens = {};
+  const closes = {};
+  for (const e of [...entities].sort((a, b) => a.offset - b.offset || b.length - a.length)) {
+    let tag = simple[e.type];
+    if (e.type === "text_link") tag = [`<a href="${esc(e.url).replace(/"/g, "&quot;")}">`, "</a>"];
+    if (e.type === "url") {
+      const u = text.substr(e.offset, e.length);
+      tag = [`<a href="${esc(/^https?:\/\//i.test(u) ? u : "https://" + u).replace(/"/g, "&quot;")}">`, "</a>"];
+    }
+    if (!tag) continue;
+    (opens[e.offset] ||= []).push(tag[0]);
+    (closes[e.offset + e.length] ||= []).unshift(tag[1]);
+  }
+  let out = "";
+  for (let i = 0; i <= text.length; i++) {
+    if (closes[i]) out += closes[i].join("");
+    if (opens[i]) out += opens[i].join("");
+    if (i < text.length) out += esc(text[i]);
+  }
+  return out;
+}
+// Что прислали для рекламы: фото, видео или GIF (null — просто текст)
+function adMediaOf(msg) {
+  if (msg.photo?.length) return { media: "photo", file: msg.photo[msg.photo.length - 1].file_id };
+  if (msg.animation) return { media: "animation", file: msg.animation.file_id };
+  if (msg.video) return { media: "video", file: msg.video.file_id };
+  return null;
+}
+// Реклама с фото/видео/GIF — отдельным сообщением прямо над сбором игроков
+function sendAdMedia(env, chatId, ad) {
+  const m = AD_MEDIA[ad.media];
+  if (!m) return { ok: false };
+  return tg(env, m[0], { chat_id: chatId, [m[1]]: ad.file, caption: "📢 <b>Реклама</b>" + (ad.html ? "\n" + ad.html : ""), parse_mode: "HTML" });
+}
+function adKindLabel(a) {
+  return a.media ? AD_MEDIA[a.media]?.[2] || "медиа" : "📝 текст";
+}
+function adBlock(html) {
+  return html ? `📢 <b>Реклама</b>\n${html}\n${AD_LINE}\n\n` : "";
+}
+
+// ---------- учёт нажатий «Старт» ----------
+async function trackStart(env, msg, payload) {
+  if (!(await dbInit(env).catch(() => false))) return;
+  const u = msg.from || {};
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO bot_users (user_id, name, username, lang, source, started_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+  )
+    .bind(u.id, displayName(u), u.username || "", u.language_code || "", String(payload || "").slice(0, 40), Date.now())
+    .run();
+}
+
+async function usersCount(env, from = 0, to = 9e15) {
+  if (!(await dbInit(env).catch(() => false))) return 0;
+  const r = await env.DB.prepare("SELECT COUNT(*) AS c FROM bot_users WHERE started_at >= ?1 AND started_at < ?2").bind(from, to).first();
+  return r?.c || 0;
+}
+async function usersSources(env, from, to = 9e15) {
+  if (!(await dbInit(env).catch(() => false))) return [];
+  const res = await env.DB.prepare(
+    "SELECT source, COUNT(*) AS c FROM bot_users WHERE started_at >= ?1 AND started_at < ?2 GROUP BY source ORDER BY c DESC"
+  )
+    .bind(from, to)
+    .all();
+  const merged = {};
+  for (const row of res.results || []) merged[sourceName(row.source)] = (merged[sourceName(row.source)] || 0) + row.c;
+  return Object.entries(merged).sort((a, b) => b[1] - a[1]);
+}
+
+// ---------- экран статистики для владельца ----------
+async function screenStats(env, chatId, msgId) {
+  if (!env.DB) return showScreen(env, chatId, msgId, "⚠️ База D1 не подключена — пользователей считать негде.", [BACK]);
+  const [total, today, week, month, sources, gs, days] = await Promise.all([
+    usersCount(env),
+    usersCount(env, localMidnight(env, 0)),
+    usersCount(env, localMidnight(env, 6)),
+    usersCount(env, localMidnight(env, 29)),
+    usersSources(env, localMidnight(env, 29)),
+    registry(env, "groups_overview", { from: localMidnight(env, 6) }),
+    registry(env, "days_sum", { days: daysBetween(env, localMidnight(env, 6), Date.now()) }),
+  ]);
+  const html =
+    "📈 <b>Статистика бота</b>\n\n" +
+    `👤 <b>Пользователей всего:</b> ${total}\n` +
+    `🆕 Новых сегодня: ${today} · за 7 дней: ${week} · за 30 дней: ${month}\n\n` +
+    "📥 <b>Откуда пришли (30 дней):</b>\n" +
+    (sources.length ? sources.slice(0, 8).map(([k, v]) => `• ${esc(k)} — ${v}`).join("\n") : "• пока никого") +
+    "\n\n" +
+    `🏠 <b>Группы:</b> подключено ${gs.total}, активны за неделю ${gs.active}\n` +
+    `   новых за неделю: ${gs.added}, удалили бота: ${gs.removed}\n` +
+    `👥 Участников во всех группах: ${gs.members}\n\n` +
+    `🎮 Запусков /game за 7 дней: ${days.games || 0}\n` +
+    `📢 Показов рекламы за 7 дней: ${days.imps || 0}\n\n` +
+    "<i>Отчёты приходят сами: каждое воскресенье и в последний день месяца в " + REPORT_HOUR + ":00.</i>";
+  return showScreen(env, chatId, msgId, html, [
+    [{ text: "👥 Последние 20 пользователей", callback_data: "st:last" }],
+    [{ text: "📊 Отчёт за неделю", callback_data: "st:rw" }, { text: "📅 За месяц", callback_data: "st:rm" }],
+    [{ text: "🔄 Обновить", callback_data: "st" }, ...BACK],
+  ]);
+}
+
+async function screenLastUsers(env, chatId, msgId) {
+  await dbInit(env);
+  const res = await env.DB.prepare("SELECT user_id, name, username, source, started_at FROM bot_users ORDER BY started_at DESC LIMIT 20").all();
+  const lines = (res.results || []).map(
+    (u, i) =>
+      `${i + 1}. <a href="tg://user?id=${u.user_id}">${esc(u.name || "без имени")}</a>` +
+      (u.username ? ` @${esc(u.username)}` : "") +
+      ` · ${fmtDateTime(env, u.started_at)} · ${esc(sourceName(u.source))}`
+  );
+  return showScreen(env, chatId, msgId, "👥 <b>Последние нажатия «Старт»</b>\n\n" + (lines.join("\n") || "Пока никого."), [
+    [{ text: "⬅️ Статистика", callback_data: "st" }],
+  ]);
+}
+
+// ---------- отчёты ----------
+async function buildReport(env, kind) {
+  const now = Date.now();
+  let from, prevFrom, prevTo, title;
+  if (kind === "month") {
+    from = localMonthStart(env, 0);
+    prevFrom = localMonthStart(env, 1);
+    prevTo = from;
+    const months = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"];
+    title = "📅 <b>Итоги месяца — " + months[new Date(now + tzOffset(env) * 3600 * 1000).getUTCMonth()] + "</b>";
+  } else {
+    from = localMidnight(env, 6);
+    prevFrom = localMidnight(env, 13);
+    prevTo = from;
+    title = `📊 <b>Итоги недели (${fmtDate(env, from)} – ${fmtDate(env, now)})</b>`;
+  }
+  const [total, cur, prev, sources, gs, days, prevDays] = await Promise.all([
+    usersCount(env),
+    usersCount(env, from),
+    usersCount(env, prevFrom, prevTo),
+    usersSources(env, from),
+    registry(env, "groups_overview", { from }),
+    registry(env, "days_sum", { days: daysBetween(env, from, now) }),
+    registry(env, "days_sum", { days: daysBetween(env, prevFrom, prevTo) }),
+  ]);
+  return (
+    title +
+    "\n\n" +
+    `👤 Новых пользователей: <b>${cur}</b>${pct(cur, prev)}\n` +
+    `👥 Всего пользователей: <b>${total}</b>\n` +
+    (sources.length ? "📥 Откуда: " + sources.slice(0, 5).map(([k, v]) => `${esc(k)} ${v}`).join(" · ") + "\n" : "") +
+    "\n" +
+    `🏠 Групп подключено: <b>${gs.total}</b> (новых: ${gs.added}, удалили бота: ${gs.removed})\n` +
+    `🔥 Активны за ${kind === "month" ? "месяц" : "неделю"}: ${gs.active} · участников во всех группах: ${gs.members}\n` +
+    `🎮 Запусков игры: <b>${days.games || 0}</b>${pct(days.games || 0, prevDays.games || 0)}\n` +
+    `📢 Показов рекламы: ${days.imps || 0}\n` +
+    `📨 Заявок на рекламу: ${days.reqs || 0}`
+  );
+}
+
+async function maybeReports(env, tick) {
+  if (!env.OWNER_ID || tick.hour !== REPORT_HOUR) return;
+  if (tick.dow === 0) {
+    const once = await registry(env, "once", { key: "rw:" + tick.day });
+    if (once.first) await tg(env, "sendMessage", { chat_id: env.OWNER_ID, parse_mode: "HTML", text: await buildReport(env, "week") });
+  }
+  const tomorrow = new Date(Date.now() + tzOffset(env) * 3600 * 1000 + 86400000);
+  if (tomorrow.getUTCDate() === 1) {
+    const once = await registry(env, "once", { key: "rm:" + tick.day.slice(0, 7) });
+    if (once.first) await tg(env, "sendMessage", { chat_id: env.OWNER_ID, parse_mode: "HTML", text: await buildReport(env, "month") });
+  }
+}
+
+// ---------- ожидание ответа в личке (текст рекламы, описание заявки) ----------
+async function getState(env, uid) {
+  const st = (await registry(env, "kv_get", { key: "st:" + uid })).value;
+  return st && Date.now() - (st.at || 0) < STATE_TTL_MS ? st : null;
+}
+function setState(env, uid, st) {
+  return registry(env, "kv_put", { key: "st:" + uid, value: st ? { ...st, at: Date.now() } : null });
+}
+
+async function ownerUsername(env) {
+  if (env.OWNER_USERNAME) return String(env.OWNER_USERNAME).replace(/^@/, "");
+  const res = await tg(env, "getChat", { chat_id: env.OWNER_ID });
+  return res.result?.username || "";
+}
+
+// ---------- кнопка «Реклама» для рекламодателей ----------
+async function screenAdvertiser(env, chatId, msgId, isOwnerPreview = false) {
+  const gs = await registry(env, "groups_overview", { from: localMidnight(env, 6) });
+  const days = await registry(env, "days_sum", { days: daysBetween(env, localMidnight(env, 6), Date.now()) });
+  const html =
+    "📢 <b>Реклама в Крокодиле</b>\n\n" +
+    `🏠 Бот подключён к <b>${gs.total}</b> группам, в них <b>${gs.members}</b> участников.\n` +
+    `🔥 Активных групп за неделю: ${gs.active}\n` +
+    `🎮 Игр запущено за неделю: ${days.games || 0}\n\n` +
+    "<b>Как показывается реклама</b>\n" +
+    "Никаких внезапных рассылок. Когда участник группы запускает игру командой /game, " +
+    "бот показывает вашу рекламу прямо над сбором игроков — её видят все, кто собирается играть.\n" +
+    "Формат: текст, фото, видео или GIF, со ссылками.\n\n" +
+    "👇 <b>В скольких группах показать рекламу?</b>";
+  const opts = [5, 10, 20, 50].filter((n) => n < gs.total);
+  const rows = [];
+  if (opts.length) rows.push(opts.map((n) => ({ text: String(n), callback_data: "avn:" + n })));
+  rows.push([{ text: `Во всех (${gs.total})`, callback_data: "avn:" + gs.total }]);
+  rows.push(isOwnerPreview ? [{ text: "⬅️ Управление рекламой", callback_data: "adv" }] : BACK);
+  return showScreen(env, chatId, msgId, html, rows);
+}
+
+async function advertiserChose(env, chatId, msgId, user, n) {
+  await setState(env, user.id, { kind: "req", groups: n });
+  return showScreen(
+    env,
+    chatId,
+    msgId,
+    `📢 Показ в <b>${n}</b> группах.\n\n✍️ Теперь <b>кратко расскажите, о чём реклама</b>: что продвигаете и для кого. ` +
+      "Напишите ответ одним сообщением сюда, в чат.",
+    [[{ text: "✖️ Отмена", callback_data: "adv" }]]
+  );
+}
+
+async function advertiserAbout(env, msg, st) {
+  const about = String(msg.text || msg.caption || "").slice(0, 1000);
+  if (!about) {
+    await tg(env, "sendMessage", { chat_id: msg.chat.id, text: "✍️ Напишите текстом, о чём реклама — одним сообщением." });
+    return;
+  }
+  await setState(env, msg.from.id, null);
+  const req = await registry(env, "req_add", {
+    req: { uid: msg.from.id, name: displayName(msg.from), username: msg.from.username || "", groups: st.groups, about },
+    day: localDayStr(env),
+  });
+  const owner = await ownerUsername(env);
+  await tg(env, "sendMessage", {
+    chat_id: msg.chat.id,
+    parse_mode: "HTML",
+    text:
+      `✅ <b>Заявка №${req.n} принята!</b>\n\n` +
+      (owner
+        ? `Чтобы обсудить детали, сроки и стоимость, напишите владельцу бота: @${esc(owner)}\nУкажите номер заявки — №${req.n}.`
+        : "Владелец бота свяжется с вами в ближайшее время."),
+    reply_markup: { inline_keyboard: [owner ? [{ text: "✉️ Написать владельцу", url: "https://t.me/" + owner }] : [], BACK].filter((r) => r.length) },
+  });
+  if (env.OWNER_ID) {
+    await tg(env, "sendMessage", {
+      chat_id: env.OWNER_ID,
+      parse_mode: "HTML",
+      text:
+        `📨 <b>Новая заявка на рекламу №${req.n}</b>\n\n` +
+        `От: <a href="tg://user?id=${msg.from.id}">${esc(displayName(msg.from))}</a>${msg.from.username ? " @" + esc(msg.from.username) : ""}\n` +
+        `Групп: ${st.groups}\n\n<b>О чём:</b>\n${esc(about)}`,
+    });
+  }
+}
+
+// ---------- управление рекламой (только владелец) ----------
+async function screenAdsAdmin(env, chatId, msgId) {
+  const { ads } = await registry(env, "ads_all", {});
+  const now = Date.now();
+  const lines = ads.map((a) => {
+    const state = !a.active ? (a.until && a.until < now ? "⌛ закончилась" : "⏸ на паузе") : "✅ идёт";
+    return (
+      `<b>№${a.id}</b> ${adKindLabel(a)} · ${state} · показов: ${a.shows || 0}\n` +
+      `   ${a.groups === "all" ? "все группы" : "групп: " + a.groups.length}` +
+      (a.until ? ` · до ${fmtDate(env, a.until)}` : " · без срока") +
+      `\n   ${esc(a.plain.slice(0, 60))}${a.plain.length > 60 ? "…" : ""}`
+    );
+  });
+  const rows = ads.slice(0, 12).map((a) => [{ text: `№${a.id} — подробнее`, callback_data: "am:v:" + a.id }]);
+  rows.push([{ text: "➕ Новая реклама", callback_data: "am:new" }]);
+  rows.push([{ text: "📨 Заявки", callback_data: "am:req" }, { text: "👀 Как видят рекламодатели", callback_data: "advp" }]);
+  rows.push(BACK);
+  return showScreen(env, chatId, msgId, "📢 <b>Реклама — управление</b>\n\n" + (lines.join("\n\n") || "Реклам пока нет."), rows);
+}
+
+async function screenAdView(env, chatId, msgId, id) {
+  const a = (await registry(env, "kv_get", { key: "ad:" + id })).value;
+  if (!a) return screenAdsAdmin(env, chatId, msgId);
+  const html =
+    `📢 <b>Реклама №${a.id}</b> · ${adKindLabel(a)}\n` +
+    `${a.active ? "✅ идёт" : "⏸ не показывается"} · показов: ${a.shows || 0}\n` +
+    `Где: ${a.groups === "all" ? "все группы" : "выбрано групп — " + a.groups.length} · ${a.until ? "до " + fmtDate(env, a.until) : "без срока"}\n\n` +
+    (a.media
+      ? "<b>Подпись:</b>\n" + (a.html || "<i>без подписи</i>") + "\n\nФото/видео идёт отдельным сообщением прямо над сбором игроков."
+      : "<b>Так она выглядит в группе:</b>\n\n" + adBlock(a.html) + "🐊 <b>Собираем игру!</b> Кто играет?…");
+  return showScreen(env, chatId, msgId, html, [
+    ...(a.media ? [[{ text: "👀 Показать как в группе", callback_data: "am:p:" + a.id }]] : []),
+    [{ text: a.active ? "⏸ Остановить" : "▶️ Запустить", callback_data: "am:x:" + a.id }, { text: "🗑 Удалить", callback_data: "am:del:" + a.id }],
+    [{ text: "⬅️ Все рекламы", callback_data: "adv" }],
+  ]);
+}
+
+async function screenAdGroups(env, chatId, msgId, st, page = 0) {
+  const { groups } = await registry(env, "groups_list", {});
+  const pages = Math.max(1, Math.ceil(groups.length / ADS_GROUPS_PAGE));
+  page = Math.min(Math.max(0, page), pages - 1);
+  const sel = st.groups === "all" ? null : new Set((st.groups || []).map(String));
+  const rows = groups.slice(page * ADS_GROUPS_PAGE, (page + 1) * ADS_GROUPS_PAGE).map((g) => [
+    {
+      text: `${!sel || sel.has(String(g.chatId)) ? "✅" : "⬜️"} ${String(g.title || "Группа").slice(0, 28)}${g.members ? " · 👥" + g.members : ""}`,
+      callback_data: `am:t:${g.chatId}:${page}`,
+    },
+  ]);
+  if (pages > 1) {
+    const nav = [];
+    if (page > 0) nav.push({ text: "◀️", callback_data: "am:g:" + (page - 1) });
+    nav.push({ text: `${page + 1} / ${pages}`, callback_data: "noop" });
+    if (page < pages - 1) nav.push({ text: "▶️", callback_data: "am:g:" + (page + 1) });
+    rows.push(nav);
+  }
+  rows.push([{ text: "🌍 Все группы", callback_data: "am:all:" + page }, { text: "⬜️ Снять все", callback_data: "am:none:" + page }]);
+  const count = sel ? sel.size : groups.length;
+  rows.push([{ text: `➡️ Дальше (${sel ? count + " выбрано" : "все группы"})`, callback_data: "am:next" }]);
+  rows.push([{ text: "✖️ Отмена", callback_data: "am:cancel" }]);
+  return showScreen(
+    env,
+    chatId,
+    msgId,
+    "📢 <b>Новая реклама — шаг 2 из 3</b>\n\nВыбери, <b>в каких группах</b> показывать. Нажатие на группу ставит или снимает галочку.\n" +
+      "«Все группы» — реклама пойдёт и в группы, которые подключатся позже.",
+    rows
+  );
+}
+
+async function handleAdsCallback(env, cq, data) {
+  const chatId = cq.message.chat.id;
+  const msgId = cq.message.message_id;
+  const uid = cq.from.id;
+  const ack = (t = "", alert = false) => tg(env, "answerCallbackQuery", { callback_query_id: cq.id, text: t, show_alert: alert });
+  const parts = data.split(":");
+  const act = parts[1];
+
+  if (act === "new") {
+    await ack();
+    await setState(env, uid, { kind: "ad", step: "text" });
+    return showScreen(
+      env,
+      chatId,
+      msgId,
+      "📢 <b>Новая реклама — шаг 1 из 3</b>\n\nПришли сюда рекламу <b>одним сообщением</b>, как она должна выглядеть в группе:\n" +
+        "• 📝 просто текст (до " + AD_MAX_LEN + " символов)\n" +
+        "• 🖼 фото, 🎬 видео или 🎞 GIF с подписью (подпись до " + AD_CAPTION_MAX + " символов)\n\n" +
+        "В тексте можно жирный шрифт и ссылки — выдели слово и добавь ссылку, как обычно в Telegram.\n" +
+        "Видео отправляй как видео, а не «файлом».",
+      [[{ text: "✖️ Отмена", callback_data: "am:cancel" }]]
+    );
+  }
+  if (act === "cancel") {
+    await ack("Отменено");
+    await setState(env, uid, null);
+    return screenAdsAdmin(env, chatId, msgId);
+  }
+  if (act === "v") return ack().then(() => screenAdView(env, chatId, msgId, parts[2]));
+  if (act === "p") {
+    const a = (await registry(env, "kv_get", { key: "ad:" + parts[2] })).value;
+    await ack();
+    if (a?.media) await sendAdMedia(env, chatId, a);
+    return;
+  }
+  if (act === "x") {
+    const a = (await registry(env, "kv_get", { key: "ad:" + parts[2] })).value;
+    if (a) {
+      a.active = !a.active;
+      if (a.active && a.until && a.until < Date.now()) a.until = null; // перезапуск закончившейся — без срока
+      await registry(env, "kv_put", { key: "ad:" + a.id, value: a });
+    }
+    await ack(a?.active ? "Реклама запущена" : "Реклама остановлена");
+    return screenAdView(env, chatId, msgId, parts[2]);
+  }
+  if (act === "del") {
+    await registry(env, "ad_delete", { id: parts[2] });
+    await ack("Удалено");
+    return screenAdsAdmin(env, chatId, msgId);
+  }
+  if (act === "req") {
+    await ack();
+    const { reqs } = await registry(env, "req_list", {});
+    const html =
+      "📨 <b>Заявки на рекламу</b> (последние 10)\n\n" +
+      (reqs
+        .map(
+          (r) =>
+            `<b>№${r.n}</b> · ${fmtDateTime(env, r.at)} · групп: ${r.groups}\n` +
+            `<a href="tg://user?id=${r.uid}">${esc(r.name)}</a>${r.username ? " @" + esc(r.username) : ""}\n` +
+            `${esc(String(r.about).slice(0, 200))}`
+        )
+        .join("\n\n") || "Заявок пока нет.");
+    return showScreen(env, chatId, msgId, html, [[{ text: "⬅️ Реклама", callback_data: "adv" }]]);
+  }
+
+  // шаги создания рекламы
+  const st = await getState(env, uid);
+  if (!st || st.kind !== "ad" || !(st.html || st.file)) {
+    await ack("Начни заново: «Новая реклама»", true);
+    return screenAdsAdmin(env, chatId, msgId);
+  }
+  if (act === "g") return ack().then(() => screenAdGroups(env, chatId, msgId, st, Number(parts[2]) || 0));
+  if (act === "all" || act === "none") {
+    st.groups = act === "all" ? "all" : [];
+    await setState(env, uid, st);
+    await ack();
+    return screenAdGroups(env, chatId, msgId, st, Number(parts[2]) || 0);
+  }
+  if (act === "t") {
+    // chatId группы отрицательный: "am:t:-100123:0" → parts[2] = "-100123"
+    const gid = parts[2];
+    if (st.groups === "all") st.groups = ((await registry(env, "groups_list", {})).groups || []).map((g) => String(g.chatId));
+    const set = new Set((st.groups || []).map(String));
+    set.has(gid) ? set.delete(gid) : set.add(gid);
+    st.groups = [...set];
+    await setState(env, uid, st);
+    await ack();
+    return screenAdGroups(env, chatId, msgId, st, Number(parts[3]) || 0);
+  }
+  if (act === "next") {
+    if (st.groups !== "all" && !(st.groups || []).length) return ack("Выбери хотя бы одну группу", true);
+    await ack();
+    return showScreen(env, chatId, msgId, "📢 <b>Новая реклама — шаг 3 из 3</b>\n\n<b>Сколько дней показывать?</b>", [
+      [{ text: "3 дня", callback_data: "am:d:3" }, { text: "7 дней", callback_data: "am:d:7" }],
+      [{ text: "14 дней", callback_data: "am:d:14" }, { text: "30 дней", callback_data: "am:d:30" }],
+      [{ text: "Без срока (пока не остановлю)", callback_data: "am:d:0" }],
+      [{ text: "⬅️ Назад к группам", callback_data: "am:g:0" }, { text: "✖️ Отмена", callback_data: "am:cancel" }],
+    ]);
+  }
+  if (act === "d") {
+    const days = Number(parts[2]) || 0;
+    const res = await registry(env, "ad_create", {
+      ad: { html: st.html, plain: st.plain, media: st.media || null, file: st.file || null, groups: st.groups === "all" ? "all" : st.groups, until: days ? Date.now() + days * 86400000 : null },
+    });
+    await setState(env, uid, null);
+    await ack("Реклама запущена ✅");
+    return screenAdView(env, chatId, msgId, res.id);
+  }
+  return ack();
+}
+
+// Ответ сообщением в личке, если бот ждёт текст. Возвращает true, если сообщение обработано.
+async function handlePrivateState(env, msg) {
+  const st = await getState(env, msg.from.id);
+  if (!st) return false;
+  if (st.kind === "req") {
+    await advertiserAbout(env, msg, st);
+    return true;
+  }
+  if (st.kind === "ad" && st.step === "text" && isOwnerId(env, msg.from.id)) {
+    const media = adMediaOf(msg);
+    const plain = String((media ? msg.caption : msg.text) || "");
+    const limit = media ? AD_CAPTION_MAX : AD_MAX_LEN;
+    if (!media && !plain) {
+      await tg(env, "sendMessage", { chat_id: msg.chat.id, text: "⚠️ Пришли текст, фото, видео или GIF. Видео — как видео, а не файлом." });
+      return true;
+    }
+    if (plain.length > limit) {
+      await tg(env, "sendMessage", { chat_id: msg.chat.id, text: `⚠️ Слишком длинно: ${plain.length} символов, можно до ${limit}. Пришли короче.` });
+      return true;
+    }
+    let html = entitiesToHtml(plain, (media ? msg.caption_entities : msg.entities) || []);
+    const preview = async (h) => {
+      if (media) {
+        await tg(env, "sendMessage", { chat_id: msg.chat.id, parse_mode: "HTML", text: "👀 <b>Так реклама будет выглядеть в группе</b> — отдельным сообщением прямо над сбором игроков:" });
+        return sendAdMedia(env, msg.chat.id, { ...media, html: h });
+      }
+      return tg(env, "sendMessage", {
+        chat_id: msg.chat.id,
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+        text: "👀 <b>Так реклама будет выглядеть в группе:</b>\n\n" + adBlock(h) + "🐊 <b>Собираем игру!</b> Кто играет?…",
+      });
+    };
+    const res = await preview(html);
+    if (!res.ok) {
+      html = esc(plain); // оформление не прошло — берём простой текст
+      await preview(html);
+    }
+    const next = { kind: "ad", step: "groups", html, plain, media: media?.media || null, file: media?.file || null, groups: "all" };
+    await setState(env, msg.from.id, next);
+    await screenAdGroups(env, msg.chat.id, null, next, 0);
+    return true;
+  }
+  return false;
 }
 
 // ================== ИГРА: ОДИН ОБЪЕКТ НА ГРУППУ ==================
@@ -1261,7 +1844,7 @@ export class CrocodileGame extends DurableObject {
       // кто-то хочет играть прямо сейчас — не ждём сбора, записавшиеся переходят в сбор игры
       r.status = "ended";
       await this.removeButtons(chatId, r.msgId);
-      return this.startLobby(chatId, anonAdmin ? null : msg.from, r.players);
+      return this.startLobby(chatId, anonAdmin ? null : msg.from, r.players, await this.adForLobby(chatId));
     }
     if (r.status === "lobby" || r.status === "vote" || r.status === "choice") {
       const t = {
@@ -1290,7 +1873,17 @@ export class CrocodileGame extends DurableObject {
       return this.openRound(chatId, await this.introHeader());
     }
 
-    return this.startLobby(chatId, anonAdmin ? null : msg.from);
+    return this.startLobby(chatId, anonAdmin ? null : msg.from, [], await this.adForLobby(chatId));
+  }
+
+  // реклама для первого сообщения после /game (и счётчик запусков игры)
+  async adForLobby(chatId) {
+    try {
+      const res = await this.registry("lobby_start", { chatId, day: localDayStr(this.env) });
+      return res.id ? res : null;
+    } catch {
+      return null;
+    }
   }
 
   // ---------- настройка: сложность → режим → время ----------
@@ -1732,6 +2325,7 @@ export class CrocodileGame extends DurableObject {
     const players = this.activePlayers();
     const top = await this.topLines(5);
     return (
+      adBlock(this.round?.ad) +
       (top ? "🏆 <b>Таблица лидеров группы</b>\n" + top + "\n\n" : "") +
       "🐊 <b>Собираем игру!</b> Кто играет?\n" +
       "Жми «🙋 Я играю» — не спешите, сбор ждёт всех." +
@@ -1745,15 +2339,16 @@ export class CrocodileGame extends DurableObject {
     return kb([[[`🙋 Я играю (${this.activePlayers().length})`, "ljoin"], ["▶️ Поехали", "lgo"]]]);
   }
 
-  async startLobby(chatId, initiator, prefill = []) {
+  async startLobby(chatId, initiator, prefill = [], ad = null) {
     this.game = { roster: {}, initiator: initiator?.id || null };
     const now = Date.now();
     for (const p of prefill) this.game.roster[p.id] = { name: p.name, at: now };
     if (initiator) this.game.roster[initiator.id] = { name: displayName(initiator), at: now };
     await this.ctx.storage.put("game", this.game);
-    const r = { status: "lobby", chatId, msgId: null, startedAt: now, deadline: now + LOBBY_MS };
+    const r = { status: "lobby", chatId, msgId: null, startedAt: now, deadline: now + LOBBY_MS, ad: ad && !ad.media ? ad.html : null };
     this.round = r;
     await this.save();
+    if (ad?.media) await sendAdMedia(this.env, chatId, ad).catch(() => {}); // фото/видео/GIF — отдельным сообщением над сбором
     const res = await this.send(chatId, await this.lobbyText(), { reply_markup: this.lobbyKeyboard() });
     if (this.round !== r) return;
     if (!res.ok) {
@@ -1801,9 +2396,9 @@ export class CrocodileGame extends DurableObject {
     if (!players.length) {
       this.round = { status: "idle" };
       await this.save();
-      return this.edit(r.chatId, r.msgId, "😔 Никто не записался. Начать снова — /game");
+      return this.edit(r.chatId, r.msgId, adBlock(r.ad) + "😔 Никто не записался. Начать снова — /game");
     }
-    await this.edit(r.chatId, r.msgId, `✅ <b>В игре ${players.length}:</b> ${players.map((p) => esc(p.name)).join(", ")}`);
+    await this.edit(r.chatId, r.msgId, adBlock(r.ad) + `✅ <b>В игре ${players.length}:</b> ${players.map((p) => esc(p.name)).join(", ")}`);
     return this.startVote(r.chatId);
   }
 
@@ -3671,7 +4266,7 @@ export class CrocodileGame extends DurableObject {
       // 15 минут никто не нажимал — тихо закрываем сбор
       this.round = { status: "idle" };
       await this.save();
-      return this.edit(r.chatId, r.msgId, "💤 Сбор игроков никто не трогал 15 минут — закрыл. Начать заново — /game");
+      return this.edit(r.chatId, r.msgId, adBlock(r.ad) + "💤 Сбор игроков никто не трогал 15 минут — закрыл. Начать заново — /game");
     }
     if (r.paused) return; // пауза судьи — таймеры стоят
     if (["aready", "acount", "aflag", "areview"].includes(r.status)) return this.arenaAlarm();
@@ -3763,6 +4358,20 @@ export class ArenaRegistry extends DurableObject {
       else if (path === "arena_result") out = await this.arenaResult(body.results || [], body.winnerId);
       else if (path === "arena_cancel") out = await this.arenaCancel(body.reason || "");
       else if (path === "arena_info") out = { arena: (await this.ctx.storage.get("arena")) || null };
+      else if (path === "lobby_start") out = await this.lobbyStart(body.chatId, body.day);
+      else if (path === "groups_overview") out = await this.groupsOverview(Number(body.from) || 0);
+      else if (path === "groups_list") out = await this.groupsList();
+      else if (path === "days_sum") out = await this.daysSum(body.days || []);
+      else if (path === "once") out = await this.once(String(body.key));
+      else if (path === "kv_get") out = { value: (await this.ctx.storage.get(String(body.key))) ?? null };
+      else if (path === "kv_put") {
+        if (body.value === null || body.value === undefined) await this.ctx.storage.delete(String(body.key));
+        else await this.ctx.storage.put(String(body.key), body.value);
+      } else if (path === "ads_all") out = await this.adsAll();
+      else if (path === "ad_create") out = await this.adCreate(body.ad || {});
+      else if (path === "ad_delete") out = await this.adDelete(String(body.id));
+      else if (path === "req_add") out = await this.reqAdd(body.req || {}, body.day);
+      else if (path === "req_list") out = await this.reqList();
       else if (path === "is_official") out = { official: String((await this.ctx.storage.get("official")) || "") === String(body.chatId) };
     } catch (e) {
       console.log("registry error", e?.stack || String(e));
@@ -3787,7 +4396,7 @@ export class ArenaRegistry extends DurableObject {
     if (!g) {
       const seq = ((await this.ctx.storage.get("seq")) || 0) + 1;
       await this.ctx.storage.put("seq", seq);
-      g = { chatId: snap.chatId, no: seq, titles: 0 };
+      g = { chatId: snap.chatId, no: seq, titles: 0, added: Date.now() };
     }
     g.title = snap.title || g.title || "";
     g.username = snap.username || "";
@@ -3886,6 +4495,106 @@ export class ArenaRegistry extends DurableObject {
     return { status: lobby.status, count: lobby.participants.length, size: lobbySize(this.env) };
   }
 
+  // ---------- статистика по дням и реклама ----------
+  async dayBump(day, field, n = 1) {
+    if (!day) return;
+    const key = "d:" + day;
+    const d = (await this.ctx.storage.get(key)) || {};
+    d[field] = (d[field] || 0) + n;
+    await this.ctx.storage.put(key, d);
+  }
+  async daysSum(days) {
+    const out = {};
+    if (!days.length) return out;
+    const map = await this.ctx.storage.get(days.map((d) => "d:" + d));
+    for (const v of map.values()) for (const [k, n] of Object.entries(v || {})) out[k] = (out[k] || 0) + n;
+    return out;
+  }
+  async once(key) {
+    if (await this.ctx.storage.get("once:" + key)) return { first: false };
+    await this.ctx.storage.put("once:" + key, Date.now());
+    return { first: true };
+  }
+  async groupsAll() {
+    const arena = await this.ctx.storage.get("arena");
+    return [...(await this.ctx.storage.list({ prefix: "g:" })).values()].filter((g) => !arena || String(g.chatId) !== String(arena.chatId));
+  }
+  async groupsOverview(from) {
+    const all = await this.groupsAll();
+    const live = all.filter((g) => !g.removed);
+    return {
+      total: live.length,
+      active: live.filter((g) => (g.updated || 0) >= from).length,
+      members: live.reduce((s, g) => s + (g.members || 0), 0),
+      added: all.filter((g) => (g.added || 0) >= from).length,
+      removed: all.filter((g) => g.removed && (g.removedAt || 0) >= from).length,
+    };
+  }
+  async groupsList() {
+    const live = (await this.groupsAll()).filter((g) => !g.removed);
+    live.sort((a, b) => (b.members || 0) - (a.members || 0));
+    return { groups: live.map((g) => ({ chatId: g.chatId, title: g.title, members: g.members || 0 })) };
+  }
+  async adsAll() {
+    const ids = (await this.ctx.storage.get("ads")) || [];
+    if (!ids.length) return { ads: [] };
+    const map = await this.ctx.storage.get(ids.map((id) => "ad:" + id));
+    const now = Date.now();
+    const ads = [];
+    for (const a of map.values()) {
+      if (!a) continue;
+      if (a.active && a.until && a.until < now) {
+        a.active = false;
+        await this.ctx.storage.put("ad:" + a.id, a);
+      }
+      ads.push(a);
+    }
+    return { ads: ads.sort((x, y) => y.id - x.id) };
+  }
+  async adCreate(ad) {
+    const id = ((await this.ctx.storage.get("ad_seq")) || 0) + 1;
+    const ids = (await this.ctx.storage.get("ads")) || [];
+    const a = { id, html: String(ad.html || ""), plain: String(ad.plain || ""), media: ad.media || null, file: ad.file || null, groups: ad.groups === "all" ? "all" : (ad.groups || []).map(String), until: ad.until || null, active: true, shows: 0, created: Date.now() };
+    await this.ctx.storage.put({ ad_seq: id, ads: [...ids, id], ["ad:" + id]: a });
+    return { id };
+  }
+  async adDelete(id) {
+    const ids = ((await this.ctx.storage.get("ads")) || []).filter((x) => String(x) !== id);
+    await this.ctx.storage.put("ads", ids);
+    await this.ctx.storage.delete("ad:" + id);
+    return { ok: true };
+  }
+  // /game в группе: считаем запуск и выбираем рекламу для этой группы (та, что показывалась реже)
+  async lobbyStart(chatId, day) {
+    await this.dayBump(day, "games");
+    const { ads } = await this.adsAll();
+    let best = null;
+    for (const a of ads) {
+      if (!a.active) continue;
+      if (a.groups !== "all" && !a.groups.includes(String(chatId))) continue;
+      if (!best || (a.shows || 0) < (best.shows || 0)) best = a;
+    }
+    if (!best) return {};
+    best.shows = (best.shows || 0) + 1;
+    await this.ctx.storage.put("ad:" + best.id, best);
+    await this.dayBump(day, "imps");
+    return { html: best.html, id: best.id, media: best.media || null, file: best.file || null };
+  }
+  async reqAdd(req, day) {
+    const n = ((await this.ctx.storage.get("rq_seq")) || 0) + 1;
+    await this.ctx.storage.put({ rq_seq: n, ["rq:" + n]: { ...req, n, at: Date.now() } });
+    await this.dayBump(day, "reqs");
+    return { n };
+  }
+  async reqList() {
+    const n = (await this.ctx.storage.get("rq_seq")) || 0;
+    const keys = [];
+    for (let i = n; i > 0 && keys.length < 10; i--) keys.push("rq:" + i);
+    if (!keys.length) return { reqs: [] };
+    const map = await this.ctx.storage.get(keys);
+    return { reqs: keys.map((k) => map.get(k)).filter(Boolean) };
+  }
+
   async aliveGroups() {
     const all = [...(await this.ctx.storage.list({ prefix: "g:" })).values()];
     return { chats: all.filter((g) => g.alive && !g.removed).map((g) => g.chatId) };
@@ -3904,6 +4613,7 @@ export class ArenaRegistry extends DurableObject {
   async removeGroup(chatId) {
     const g = await this.ctx.storage.get("g:" + chatId);
     if (g) {
+      if (!g.removed) g.removedAt = Date.now();
       g.removed = true;
       await this.ctx.storage.put("g:" + chatId, g);
     }
